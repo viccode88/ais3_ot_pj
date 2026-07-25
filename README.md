@@ -72,6 +72,85 @@ pytest --cov=modbus_cli --cov-report=term-missing
 OpenPLC 測試預設跳過；未來顯式配置實驗室後以 `pytest -m openplc` 執行。架構與 fuzz 說明見
 [`docs/architecture.md`](docs/architecture.md) 和 [`docs/fuzzing.md`](docs/fuzzing.md)。
 
+## 獨立 OpenPLC 版本探測器
+
+repository 另含獨立的 `plcfp` 套件；它不匯入 `modbus_cli`，可主動判別 OpenPLC Runtime
+v3/v4、輸出版本區間與證據鏈，也可離線分析 PCAP。安全分級、硬性封包預算、TLS/HTTP、
+Socket.IO、唯讀 Modbus、ENIP、OPC UA 與 lab-only DNP3 的操作方式見
+[`docs/openplc-fingerprinting.md`](docs/openplc-fingerprinting.md)。
+
+### 實際搭建 OpenPLC v3 並探測
+
+lab 使用官方 archived `OpenPLC_v3` commit
+`b5d41356dab4aeadca0dd7ca64ba542f870b595d`，所有服務只綁在 loopback。預設映射為：
+
+- Modbus TCP：`127.0.0.1:1502 → container:502`
+- HTTP UI：`127.0.0.1:18080 → container:8080`
+- EtherNet/IP：`127.0.0.1:14418 → container:44818`（TCP 與 UDP）
+
+建置、啟動 Runtime：
+
+```bash
+docker compose -f lab/openplc-v3/compose.yaml build
+docker compose -f lab/openplc-v3/compose.yaml up -d
+curl -I http://127.0.0.1:18080/login
+lab/openplc-v3/start-runtime.sh
+```
+
+先用保守模式確認主版本：
+
+```bash
+plcfp scan 127.0.0.1 \
+  --profile safe \
+  --max-layer 2 \
+  --modbus-port 1502 \
+  --v3-http-port 18080 \
+  --enip-port 14418 \
+  --no-raw
+```
+
+再執行完整的 standard/L4 唯讀探測並保存報告：
+
+```bash
+plcfp scan 127.0.0.1 \
+  --profile standard \
+  --max-layer 4 \
+  --modbus-port 1502 \
+  --v3-http-port 18080 \
+  --enip-port 14418 \
+  --no-raw \
+  --output openplc-v3-report.json
+```
+
+2026-07-25 對上述固定 commit 的實測摘要：
+
+```json
+{
+  "product": "OpenPLC Runtime",
+  "major": "v3",
+  "version_range": {"min": null, "max": null},
+  "point_estimate": null,
+  "build_epoch": "epoch≈2025-Q4 (v3 release marker)",
+  "confidence": 0.896,
+  "lifecycle": "end-of-life",
+  "status": "complete",
+  "packets_sent": 144
+}
+```
+
+同次探測確認 FC43 回傳例外碼 `01`、Unit ID `0/1/247/255` 全部有回應、唯讀功能碼
+bitmap 為 `0x1e`，位址上界為 `(8184, 8184, 1023, 8191)`。ENIP `ListIdentity` 沒有回應，
+但 `RegisterSession` 成功；工具會把這種「負面＋正面」組合完整保留，而不是視為掃描失敗。
+可重現的完整摘要在
+[`lab/openplc-v3/verified-result.json`](lab/openplc-v3/verified-result.json)，lab 細節見
+[`lab/openplc-v3/README.md`](lab/openplc-v3/README.md)。
+
+測試完成後停止並移除 lab 容器與網路（保留已建映像，方便下次啟動）：
+
+```bash
+docker compose -f lab/openplc-v3/compose.yaml down
+```
+
 ## Roadmap、貢獻與授權
 
 Roadmap：持久連線/分段時序、health-check orchestration、RTU/ASCII/TLS transports、完整
