@@ -1,0 +1,18 @@
+[target]
+host = "192.168.56.10"
+port = 502
+unit_id = 1
+
+[safety]
+allow_public_targets = false
+allow_write_functions = false
+max_requests = 10000
+max_rate = 50
+max_concurrency = 4
+
+[health_check]
+function = 3
+address = 0
+quantity = 1
+timeout = 1.0
+retries = 3
