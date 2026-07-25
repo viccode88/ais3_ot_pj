@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "modbus-lab-cli"
+version = "0.2.0"
+description = "Safety-oriented Modbus protocol and fuzz testing framework"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = []
+
+[project.scripts]
+modbus-cli = "modbus_cli.cli:main"
+mbfuzz = "modbus_cli.cli:main"
+
+[project.entry-points."modbus_cli.plugins"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.6", "mypy>=1.11"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/modbus_cli"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+markers = ["openplc: requires an explicitly configured isolated OpenPLC lab"]
