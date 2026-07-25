@@ -200,7 +200,9 @@ def mutate_malformed(base):
         pkt = struct.pack(">HHHB", tid, 0, fake_len, unit) + pdu
     elif strategy == "huge_payload":
         n = random.randint(200, 2000)
-        pdu = struct.pack(">BHHB", 16, 0, n, n * 2) + os.urandom(n * 2)
+        # byte_count 欄位僅 1 byte，故意讓它與實際超長 payload 不符 (畸形)
+        byte_count = (n * 2) & 0xFF
+        pdu = struct.pack(">BHHB", 16, 0, n & 0xFFFF, byte_count) + os.urandom(n * 2)
         pkt = struct.pack(">HHHB", tid, 0, len(pdu) + 1, unit) + pdu
     else:  # random_bytes
         pkt = os.urandom(random.randint(4, 64))

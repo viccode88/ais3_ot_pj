@@ -12,8 +12,10 @@ python3 modbus_cli.py server --port 1502
 python3 modbus_cli.py build -f 3 -a 0 -q 10
 
 # 3. 送出封包並解析回應
+# 讀取 5 個 holding registers
 python3 modbus_cli.py send --host 127.0.0.1 --port 1502 -f 3 -a 0 -q 5
-python3 modbus_cli.py send --host 127.0.0.1 --port 1502 -f 6 -a 1 -v 1234   # 寫單一暫存器
+# 寫單一暫存器 (值 1234 到位址 1)
+python3 modbus_cli.py send --host 127.0.0.1 --port 1502 -f 6 -a 1 -v 1234
 
 # 4. 模糊測試
 python3 modbus_cli.py fuzz --host 127.0.0.1 --port 1502 -n 200 -o report.json --verbose
