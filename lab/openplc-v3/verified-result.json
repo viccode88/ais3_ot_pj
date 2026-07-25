@@ -1,0 +1,44 @@
+{
+  "verified_at": "2026-07-25",
+  "source_repository": "https://github.com/thiagoralves/OpenPLC_v3",
+  "source_commit": "b5d41356dab4aeadca0dd7ca64ba542f870b595d",
+  "command": "plcfp scan 127.0.0.1 --profile standard --max-layer 4 --modbus-port 1502 --v3-http-port 18080 --enip-port 14418 --no-raw",
+  "result": {
+    "product": "OpenPLC Runtime",
+    "major": "v3",
+    "version_range": {
+      "min": null,
+      "max": null
+    },
+    "point_estimate": null,
+    "build_epoch": "epoch≈2025-Q4 (v3 release marker)",
+    "confidence": 0.896,
+    "lifecycle": "end-of-life",
+    "status": "complete",
+    "packets_sent": 144
+  },
+  "protocol_evidence": {
+    "http": {
+      "login_status": 200,
+      "protected_routes_redirecting_to_login": 12,
+      "server": "Werkzeug/2.3.7 Python/3.13.5"
+    },
+    "modbus": {
+      "fc43_exception_code": 1,
+      "all_test_unit_ids_responded": true,
+      "read_only_function_bitmap": "0x1e",
+      "max_addresses": {
+        "coils": 8184,
+        "discrete_inputs": 8184,
+        "input_registers": 1023,
+        "holding_registers": 8191
+      },
+      "timing_note": "30/30 responses; latency is host-dependent"
+    },
+    "enip": {
+      "list_identity": "timeout",
+      "register_session": "success",
+      "note": "This negative/positive combination is retained as auditable evidence."
+    }
+  }
+}

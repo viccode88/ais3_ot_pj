@@ -1,0 +1,12 @@
+services:
+  openplc-v3:
+    build:
+      context: https://github.com/thiagoralves/OpenPLC_v3.git#b5d41356dab4aeadca0dd7ca64ba542f870b595d
+    image: plcfp-openplc-v3-lab:local
+    container_name: plcfp-openplc-v3-lab
+    restart: "no"
+    ports:
+      - "127.0.0.1:${OPENPLC_V3_MODBUS_PORT:-1502}:502"
+      - "127.0.0.1:${OPENPLC_V3_HTTP_PORT:-18080}:8080"
+      - "127.0.0.1:${OPENPLC_V3_ENIP_PORT:-14418}:44818/tcp"
+      - "127.0.0.1:${OPENPLC_V3_ENIP_PORT:-14418}:44818/udp"

@@ -1,0 +1,104 @@
+{
+  "schema_version": "1.0",
+  "database_version": "2026.07.25.1",
+  "generated_at": "2026-07-25",
+  "product": "OpenPLC Runtime",
+  "ranges": {
+    "v3": {"min": "", "max": ""}
+  },
+  "assets": {
+    "v3": {
+      "complete": false,
+      "features": {
+        "http.v3.style": [],
+        "http.v3.favicon": [],
+        "http.v3.logo": [],
+        "http.v3.roboto_css": []
+      },
+      "note": "Populate from the v3 time-sliced harvest matrix before enabling complete."
+    }
+  },
+  "rules": [
+    {
+      "id": "v3-login-brand",
+      "feature": "http.v3.login",
+      "matcher": {"op": "eq", "path": "mentions_openplc", "value": true},
+      "major": "v3",
+      "weight": 1.4,
+      "supports": "OpenPLC v3 web UI",
+      "rationale": "The unauthenticated login HTML identifies OpenPLC."
+    },
+    {
+      "id": "v3-login-form",
+      "feature": "http.v3.login",
+      "matcher": {"op": "eq", "path": "has_password_field", "value": true},
+      "major": "v3",
+      "weight": 0.35,
+      "supports": "v3-style web UI",
+      "rationale": "v3 exposes a browser login form; v4 Runtime has no web UI."
+    },
+    {
+      "id": "v3-release-marker",
+      "feature": "http.v3.login",
+      "matcher": {"op": "regex", "path": "release_date", "value": "^\\d{4}-\\d{2}-\\d{2}$"},
+      "major": "v3",
+      "weight": 0.4,
+      "supports": "OpenPLC v3 dated build epoch",
+      "rationale": "The v3 login page contains a dated Release marker; it is an epoch, not semver."
+    },
+    {
+      "id": "v3-root-login-redirect",
+      "feature": "http.v3.root",
+      "matcher": {"op": "in", "path": "status", "value": [301, 302, 303, 307, 308]},
+      "major": "v3",
+      "weight": 0.45,
+      "supports": "v3-style authenticated Flask UI",
+      "rationale": "The v3 root route normally redirects unauthenticated users."
+    },
+    {
+      "id": "v3-route-matrix",
+      "feature": "http.v3.route_matrix",
+      "matcher": {"op": "registered_count_gte", "value": 5},
+      "major": "v3",
+      "weight": 1.2,
+      "supports": "OpenPLC v3 route family",
+      "rationale": "Multiple protected OpenPLC management routes are registered."
+    },
+    {
+      "id": "v3-style-present",
+      "feature": "http.v3.style",
+      "matcher": {"op": "eq", "path": "status", "value": 200},
+      "major": "v3",
+      "weight": 0.25,
+      "supports": "v3 static asset layout",
+      "rationale": "The expected v3 stylesheet path exists."
+    },
+    {
+      "id": "v3-enip-product-name",
+      "feature": "enip.list_identity",
+      "matcher": {"op": "contains", "path": "identities", "value": "openplc"},
+      "major": "v3",
+      "weight": 1.5,
+      "supports": "OpenPLC v3 EtherNet/IP implementation",
+      "rationale": "ListIdentity returned an OpenPLC product name."
+    },
+    {
+      "id": "v3-modbus-all-unit-ids",
+      "feature": "modbus.unit_id.response_matrix",
+      "matcher": {"op": "all_responded"},
+      "major": "v3",
+      "weight": 0.45,
+      "supports": "v3-like Modbus unit-ID behavior",
+      "rationale": "All test unit IDs responded; this is supporting, not conclusive, evidence."
+    },
+    {
+      "id": "v3-modbus-fc43-illegal-function",
+      "feature": "modbus.fc43.device_identification",
+      "matcher": {"op": "eq", "path": "exception_code", "value": 1},
+      "major": "v3",
+      "weight": 0.3,
+      "supports": "v3-like custom Modbus stack",
+      "rationale": "FC43 is rejected as Illegal Function; many non-OpenPLC devices behave differently."
+    }
+  ]
+}

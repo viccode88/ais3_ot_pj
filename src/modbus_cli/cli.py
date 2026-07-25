@@ -14,7 +14,14 @@ from typing import Any
 
 from . import __version__
 from .exceptions import ModbusCLIError
-from .fuzzing import STRATEGIES, CaseGenerator, execute_cases, save_cases
+from .fuzzing import (
+    STRATEGIES,
+    CaseGenerator,
+    FuzzCase,
+    FuzzProgressEvent,
+    execute_cases,
+    save_cases,
+)
 from .plugins import discover, validate
 from .protocol import decode_adu, encode_adu
 from .safety import SafetyPolicy
@@ -24,9 +31,22 @@ DEFAULT_CONFIG = Path.home() / ".config/modbus-cli/config.toml"
 
 
 def _common_target(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--target", required=True)
-    parser.add_argument("--port", type=int, default=502)
-    parser.add_argument("--timeout", type=float, default=1.5)
+    parser.add_argument(
+        "--target",
+        required=True,
+        metavar="HOST",
+        help="authorized private/loopback IPv4 target or hostname",
+    )
+    parser.add_argument(
+        "--port", type=int, default=502, metavar="PORT", help="TCP port (default: 502)"
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=1.5,
+        metavar="SEC",
+        help="connect/read timeout in seconds (default: 1.5)",
+    )
 
 
 def parser() -> argparse.ArgumentParser:
@@ -34,83 +54,229 @@ def parser() -> argparse.ArgumentParser:
         prog="modbus-cli", description="Authorized Modbus laboratory testing framework"
     )
     root.add_argument("--version", action="version", version=__version__)
-    commands = root.add_subparsers(dest="command", required=True)
-    commands.add_parser("version")
-    commands.add_parser("info")
-    build = commands.add_parser("build")
+    commands = root.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    commands.add_parser("version", help="show the version as JSON")
+    commands.add_parser("info", help="show runtime, transport, strategy, and plugin information")
+    build = commands.add_parser("build", help="build a Modbus TCP ADU without transmitting it")
     _packet_args(build)
-    build.add_argument("--output", choices=("text", "hex", "json", "binary"), default="text")
-    decode = commands.add_parser("decode")
+    build.add_argument(
+        "--output",
+        choices=("text", "hex", "json", "binary"),
+        default="text",
+        help="output representation (default: text)",
+    )
+    decode = commands.add_parser("decode", help="decode a hex or binary Modbus TCP ADU")
     source = decode.add_mutually_exclusive_group(required=True)
-    source.add_argument("--hex")
-    source.add_argument("--file", type=Path)
-    decode.add_argument("--output", choices=("text", "json"), default="text")
-    send = commands.add_parser("send")
+    source.add_argument("--hex", metavar="HEX", help="hexadecimal ADU")
+    source.add_argument("--file", type=Path, metavar="PATH", help="raw binary ADU file")
+    decode.add_argument(
+        "--output",
+        choices=("text", "json"),
+        default="text",
+        help="output representation (default: text)",
+    )
+    send = commands.add_parser("send", help="transmit an arbitrary Modbus TCP ADU")
     _common_target(send)
     source = send.add_mutually_exclusive_group(required=True)
-    source.add_argument("--hex")
-    source.add_argument("--file", type=Path)
-    send.add_argument("--no-response", action="store_true")
-    send.add_argument("--output", choices=("text", "json"), default="text")
-    read = commands.add_parser("read")
+    source.add_argument("--hex", metavar="HEX", help="hexadecimal ADU to transmit")
+    source.add_argument("--file", type=Path, metavar="PATH", help="raw binary ADU file to transmit")
+    send.add_argument(
+        "--no-response",
+        action="store_true",
+        help="send without waiting for a response",
+    )
+    send.add_argument(
+        "--output",
+        choices=("text", "json"),
+        default="text",
+        help="output representation (default: text)",
+    )
+    read = commands.add_parser("read", help="send one FC01-FC04 read request")
     read.add_argument(
-        "kind", choices=("coils", "discrete-inputs", "holding-registers", "input-registers")
+        "kind",
+        choices=("coils", "discrete-inputs", "holding-registers", "input-registers"),
+        help="Modbus data type to read",
     )
     _common_target(read)
-    read.add_argument("--unit-id", type=int, default=1)
-    read.add_argument("--address", type=int, required=True)
-    read.add_argument("--quantity", type=int, required=True)
-    write = commands.add_parser("write")
+    read.add_argument("--unit-id", type=int, default=1, metavar="ID", help="unit ID (default: 1)")
+    read.add_argument(
+        "--address",
+        type=int,
+        required=True,
+        metavar="ADDRESS",
+        help="zero-based protocol address",
+    )
+    read.add_argument(
+        "--quantity",
+        type=int,
+        required=True,
+        metavar="COUNT",
+        help="number of coils or registers",
+    )
+    write = commands.add_parser("write", help="preview a write request (writes are disabled)")
     write.add_argument(
-        "kind", choices=("single-coil", "single-register", "multiple-coils", "multiple-registers")
+        "kind",
+        choices=("single-coil", "single-register", "multiple-coils", "multiple-registers"),
+        help="Modbus write operation",
     )
     _common_target(write)
-    write.add_argument("--unit-id", type=int, default=1)
-    write.add_argument("--address", type=int, required=True)
-    write.add_argument("--values", required=True, help="comma-separated integers")
-    write.add_argument("--dry-run", action="store_true")
-    write.add_argument("--confirm", action="store_true")
-    fuzz = commands.add_parser("fuzz")
+    write.add_argument("--unit-id", type=int, default=1, metavar="ID", help="unit ID (default: 1)")
+    write.add_argument(
+        "--address",
+        type=int,
+        required=True,
+        metavar="ADDRESS",
+        help="zero-based protocol address",
+    )
+    write.add_argument("--values", required=True, metavar="CSV", help="comma-separated integers")
+    write.add_argument("--dry-run", action="store_true", help="only display the encoded request")
+    write.add_argument(
+        "--confirm",
+        action="store_true",
+        help="confirm transmission (still blocked by the default safety policy)",
+    )
+    fuzz = commands.add_parser(
+        "fuzz", help="generate or explicitly execute deterministic fuzz cases"
+    )
     _common_target(fuzz)
-    fuzz.add_argument("--unit-id", type=int, default=1)
-    fuzz.add_argument("--strategy", action="append", choices=STRATEGIES, default=[])
-    fuzz.add_argument("--requests", type=int, default=100)
+    fuzz.add_argument("--unit-id", type=int, default=1, metavar="ID", help="unit ID (default: 1)")
+    fuzz.add_argument(
+        "--strategy",
+        action="append",
+        choices=STRATEGIES,
+        default=[],
+        help="mutation strategy; repeat to cycle strategies (default: boundary)",
+    )
+    fuzz.add_argument(
+        "--requests",
+        type=int,
+        default=100,
+        metavar="COUNT",
+        help="number of cases, 1..10000 (default: 100)",
+    )
     pacing = fuzz.add_mutually_exclusive_group()
-    pacing.add_argument("--rate", type=float, default=10, help="maximum requests per second")
-    pacing.add_argument("--interval", type=float, help="seconds to wait between requests")
-    fuzz.add_argument("--concurrency", type=int, default=1)
-    fuzz.add_argument("--seed", type=int, default=1)
-    fuzz.add_argument("--output", type=Path, default=Path("artifacts/fuzz-report.json"))
+    pacing.add_argument(
+        "--rate",
+        type=float,
+        default=10,
+        metavar="RPS",
+        help="maximum requests per second (default: 10)",
+    )
+    pacing.add_argument(
+        "--interval",
+        type=float,
+        metavar="SEC",
+        help="seconds to wait between requests instead of --rate",
+    )
+    fuzz.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        metavar="COUNT",
+        help="safety limit; execution is currently sequential (default: 1)",
+    )
+    fuzz.add_argument("--seed", type=int, default=1, metavar="SEED", help="PRNG seed (default: 1)")
+    fuzz.add_argument(
+        "--output",
+        type=Path,
+        default=Path("artifacts/fuzz-report.json"),
+        metavar="PATH",
+        help="JSON report path (default: artifacts/fuzz-report.json)",
+    )
     fuzz.add_argument(
         "--execute", action="store_true", help="required to transmit; otherwise generate only"
     )
-    replay = commands.add_parser("replay")
-    replay.add_argument("case", type=Path)
-    replay.add_argument("--times", type=int, default=1)
-    replay.add_argument("--timeout", type=float, default=1.5)
-    replay.add_argument("--interval", type=float, default=0, help="seconds between replays")
-    minimize = commands.add_parser("minimize")
-    minimize.add_argument("case", type=Path)
-    probe = commands.add_parser("probe")
+    replay = commands.add_parser("replay", help="retransmit the first case in a JSON report")
+    replay.add_argument("case", type=Path, metavar="CASE", help="case object or report array")
+    replay.add_argument(
+        "--times",
+        type=int,
+        default=1,
+        metavar="COUNT",
+        help="number of transmissions (default: 1)",
+    )
+    replay.add_argument(
+        "--timeout",
+        type=float,
+        default=1.5,
+        metavar="SEC",
+        help="connect/read timeout in seconds (default: 1.5)",
+    )
+    replay.add_argument(
+        "--interval",
+        type=float,
+        default=0,
+        metavar="SEC",
+        help="seconds between replays (default: 0)",
+    )
+    minimize = commands.add_parser("minimize", help="create a structural baseline from a case")
+    minimize.add_argument("case", type=Path, metavar="CASE", help="case object or report array")
+    probe = commands.add_parser("probe", help="send one FC03 health probe")
     _common_target(probe)
-    probe.add_argument("--unit-id", type=int, default=1)
-    plugins = commands.add_parser("plugins")
-    plugins.add_argument("action", choices=("list", "info", "validate"))
-    plugins.add_argument("name", nargs="?")
-    config = commands.add_parser("config")
-    config.add_argument("action", choices=("show", "validate", "init"))
-    config.add_argument("--file", type=Path, default=DEFAULT_CONFIG)
+    probe.add_argument("--unit-id", type=int, default=1, metavar="ID", help="unit ID (default: 1)")
+    plugins = commands.add_parser("plugins", help="list, inspect, or validate installed plugins")
+    plugins.add_argument(
+        "action",
+        choices=("list", "info", "validate"),
+        help="plugin operation",
+    )
+    plugins.add_argument("name", nargs="?", help="plugin name for info or validate")
+    config = commands.add_parser("config", help="initialize, show, or validate a TOML config file")
+    config.add_argument(
+        "action",
+        choices=("show", "validate", "init"),
+        help="configuration operation",
+    )
+    config.add_argument(
+        "--file",
+        type=Path,
+        default=DEFAULT_CONFIG,
+        metavar="PATH",
+        help=f"config path (default: {DEFAULT_CONFIG})",
+    )
     return root
 
 
 def _packet_args(item: argparse.ArgumentParser) -> None:
-    item.add_argument("--transaction-id", type=int, default=1)
-    item.add_argument("--protocol-id", type=int, default=0)
-    item.add_argument("--unit-id", type=int, default=1)
-    item.add_argument("--function", type=int, required=True)
-    item.add_argument("--address", type=int, default=0)
-    item.add_argument("--quantity", type=int, default=1)
-    item.add_argument("--values")
+    item.add_argument(
+        "--transaction-id",
+        type=int,
+        default=1,
+        metavar="ID",
+        help="MBAP transaction ID (default: 1)",
+    )
+    item.add_argument(
+        "--protocol-id",
+        type=int,
+        default=0,
+        metavar="ID",
+        help="MBAP protocol ID (default: 0)",
+    )
+    item.add_argument("--unit-id", type=int, default=1, metavar="ID", help="unit ID (default: 1)")
+    item.add_argument(
+        "--function",
+        type=int,
+        required=True,
+        metavar="CODE",
+        help="decimal Modbus function code",
+    )
+    item.add_argument(
+        "--address",
+        type=int,
+        default=0,
+        metavar="ADDRESS",
+        help="zero-based protocol address (default: 0)",
+    )
+    item.add_argument(
+        "--quantity",
+        type=int,
+        default=1,
+        metavar="COUNT",
+        help="coil/register quantity (default: 1)",
+    )
+    item.add_argument(
+        "--values", metavar="CSV", help="comma-separated decimal or 0x-prefixed values"
+    )
 
 
 def _packet(ns: argparse.Namespace) -> bytes:
@@ -128,11 +294,74 @@ def _packet(ns: argparse.Namespace) -> bytes:
     )
 
 
-def _safe_transport(ns: argparse.Namespace) -> TCPTransport:
-    host = SafetyPolicy().validate_target(ns.target)
+def _validate_transport_options(ns: argparse.Namespace) -> None:
     if not 1 <= ns.port <= 65535 or ns.timeout <= 0:
         raise ValueError("invalid port or timeout")
+
+
+def _safe_transport(ns: argparse.Namespace) -> TCPTransport:
+    host = SafetyPolicy().validate_target(ns.target)
+    _validate_transport_options(ns)
     return TCPTransport(host, ns.port, ns.timeout)
+
+
+def _fuzz_request_type(case: FuzzCase) -> str:
+    decoded = decode_adu(bytes.fromhex(case.request_hex))
+    if decoded.function_code is None:
+        return "malformed-request (function code unavailable)"
+    details = [f"FC 0x{decoded.function_code:02X}"]
+    if decoded.function_code & 0x80:
+        details.append("exception-bit-set")
+    if decoded.warnings:
+        details.append("malformed framing")
+    return f"{decoded.function_name or 'unknown'} ({', '.join(details)})"
+
+
+def _fuzz_response_type(case: FuzzCase) -> str:
+    if not case.response_hex:
+        return "no-packet"
+    decoded = decode_adu(bytes.fromhex(case.response_hex))
+    if decoded.function_code is None:
+        return "malformed-response (function code unavailable)"
+    function = decoded.function_name or "unknown"
+    details = [f"FC 0x{decoded.function_code:02X}"]
+    if decoded.function_code & 0x80:
+        exception = str(decoded.fields.get("exception_name", "unknown"))
+        exception_code = (
+            f"0x{decoded.exception_code:02X}"
+            if decoded.exception_code is not None
+            else "unavailable"
+        )
+        details.append(f"exception={exception} {exception_code}")
+        if decoded.warnings:
+            details.append("malformed framing")
+        response_type = "exception-response"
+    elif decoded.warnings:
+        details.append("malformed framing")
+        response_type = "malformed-response"
+    else:
+        response_type = "normal-response"
+    return f"{response_type}/{function} ({', '.join(details)})"
+
+
+def _print_fuzz_progress(event: FuzzProgressEvent, case: FuzzCase) -> None:
+    if event == "sending":
+        target = f"{case.target['host']}:{case.target['port']}"
+        strategy = ",".join(case.strategy)
+        print(
+            f"[{case.case_id}] TX request-type={_fuzz_request_type(case)}; "
+            f"target={target}; strategy={strategy}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    elapsed = f"{case.elapsed_ms:.3f}" if case.elapsed_ms is not None else "unavailable"
+    print(
+        f"[{case.case_id}] RX response-type={_fuzz_response_type(case)}; "
+        f"status={case.status}; elapsed_ms={elapsed}; classification={case.classification}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def run(ns: argparse.Namespace) -> Any:
@@ -206,6 +435,7 @@ def run(ns: argparse.Namespace) -> Any:
     if ns.command == "fuzz":
         policy = SafetyPolicy()
         host = policy.validate_target(ns.target)
+        _validate_transport_options(ns)
         if ns.interval is not None and ns.interval <= 0:
             raise ValueError("interval must be > 0")
         rate = 1 / ns.interval if ns.interval is not None else ns.rate
@@ -217,7 +447,7 @@ def run(ns: argparse.Namespace) -> Any:
             for i in range(ns.requests)
         ]
         interval = ns.interval if ns.interval is not None else 1 / rate
-        execute_cases(cases, ns.timeout, interval) if ns.execute else None
+        execute_cases(cases, ns.timeout, interval, _print_fuzz_progress) if ns.execute else None
         save_cases(ns.output, cases)
         return {
             "seed": ns.seed,

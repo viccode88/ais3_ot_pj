@@ -1,0 +1,100 @@
+{
+  "schema_version": "1.0",
+  "database_version": "2026.07.25.1",
+  "generated_at": "2026-07-25",
+  "product": "OpenPLC Runtime",
+  "ranges": {
+    "v4": {"min": "4.0.0", "max": "4.1.7"}
+  },
+  "assets": {
+    "v4": {
+      "complete": false,
+      "features": {},
+      "note": "v4 has no web UI; populate stable unauthenticated response hashes if harvested."
+    }
+  },
+  "rules": [
+    {
+      "id": "v4-tls-cn",
+      "feature": "tls.cert.subject_cn",
+      "matcher": {"op": "contains", "value": "openplc"},
+      "major": "v4",
+      "weight": 1.7,
+      "supports": "OpenPLC v4",
+      "rationale": "The self-signed TLS certificate subject contains the OpenPLC product name."
+    },
+    {
+      "id": "v4-users-info",
+      "feature": "http.v4.users_info",
+      "matcher": {"op": "eq", "path": "status", "value": 200},
+      "major": "v4",
+      "weight": 1.5,
+      "supports": "OpenPLC v4 REST API",
+      "rationale": "The unauthenticated v4 users-info endpoint returned successfully."
+    },
+    {
+      "id": "v4-socketio",
+      "feature": "http.v4.socketio_handshake",
+      "matcher": {"op": "exists", "path": "engine_io"},
+      "major": "v4",
+      "weight": 1.25,
+      "supports": "OpenPLC v4 debug channel",
+      "rationale": "A valid Engine.IO polling handshake was returned."
+    },
+    {
+      "id": "v4-socketio-max-payload",
+      "feature": "http.v4.socketio_handshake",
+      "matcher": {"op": "eq", "path": "has_max_payload", "value": true},
+      "major": "v4",
+      "weight": 0.55,
+      "supports": ">=4.1.3 (provisional signature)",
+      "introduced": "4.1.3",
+      "rationale": "The maxPayload field constrains the bundled Engine.IO generation; lab validation remains required."
+    },
+    {
+      "id": "v4-root-no-ui",
+      "feature": "http.v4.root",
+      "matcher": {"op": "eq", "path": "status", "value": 404},
+      "major": "v4",
+      "weight": 0.35,
+      "supports": "v4 no-web-UI architecture",
+      "rationale": "The HTTPS root has no browser UI."
+    },
+    {
+      "id": "v4-jwt-protected-status",
+      "feature": "http.v4.status",
+      "matcher": {"op": "in", "path": "status", "value": [401, 422]},
+      "major": "v4",
+      "weight": 0.55,
+      "supports": "v4 JWT API",
+      "rationale": "The API status route produced an authentication-layer response."
+    },
+    {
+      "id": "v4-opcua-plugin",
+      "feature": "opcua.hello_ack",
+      "matcher": {"op": "eq", "path": "message_type", "value": "ACK"},
+      "major": "v4",
+      "weight": 0.45,
+      "supports": "v4-compatible OPC UA plugin",
+      "rationale": "An OPC UA TCP endpoint responded; this is supporting evidence only."
+    },
+    {
+      "id": "v4-passive-editor-runtime",
+      "feature": "passive.v4.editor_runtime",
+      "matcher": {"op": "eq", "value": true},
+      "major": "v4",
+      "weight": 1.6,
+      "supports": "OpenPLC v4 Editor-to-Runtime traffic",
+      "rationale": "The capture contains v4 API polling or Socket.IO paths."
+    },
+    {
+      "id": "v4-passive-tls-port",
+      "feature": "passive.tls.8443",
+      "matcher": {"op": "eq", "value": true},
+      "major": "v4",
+      "weight": 0.2,
+      "supports": "possible v4 TLS service",
+      "rationale": "TLS traffic on 8443 is weak supporting evidence and is not conclusive alone."
+    }
+  ]
+}

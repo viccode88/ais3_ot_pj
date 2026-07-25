@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import random
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from .protocol import decode_adu, encode_adu
 from .transport import TCPTransport
@@ -40,6 +41,10 @@ class FuzzCase:
     status: str = "pending"
     classification: str = "inconclusive"
     reproducible: bool | None = None
+
+
+FuzzProgressEvent = Literal["sending", "result"]
+FuzzProgressCallback = Callable[[FuzzProgressEvent, FuzzCase], None]
 
 
 class CaseGenerator:
@@ -99,12 +104,19 @@ class CaseGenerator:
         )
 
 
-def execute_cases(cases: list[FuzzCase], timeout: float, interval: float) -> list[FuzzCase]:
+def execute_cases(
+    cases: list[FuzzCase],
+    timeout: float,
+    interval: float,
+    progress: FuzzProgressCallback | None = None,
+) -> list[FuzzCase]:
     """Execute cases sequentially with a fixed delay between transmissions."""
     if interval < 0:
         raise ValueError("interval must be >= 0")
     for index, case in enumerate(cases):
         case.sent_at = datetime.now(UTC).isoformat()
+        if progress:
+            progress("sending", case)
         port = cast(int, case.target["port"])
         transport = TCPTransport(str(case.target["host"]), port, timeout)
         result = transport.exchange(bytes.fromhex(case.request_hex))
@@ -118,6 +130,8 @@ def execute_cases(cases: list[FuzzCase], timeout: float, interval: float) -> lis
             case.classification = "possible-parser-inconsistency"
         else:
             case.classification = "normal-or-exception-response"
+        if progress:
+            progress("result", case)
         if interval and index < len(cases) - 1:
             time.sleep(interval)
     return cases
