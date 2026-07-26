@@ -17,7 +17,7 @@
 
 ```bash
 git clone https://github.com/viccode88/ais3_ot_pj.git
-cd modbus封包產生
+cd ais3_ot_pj
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e .
