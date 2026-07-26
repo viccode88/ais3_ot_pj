@@ -331,6 +331,61 @@ lab/openplc-v3/start-runtime.sh
 詳細步驟、預期結果與停止方式請見
 [`lab/openplc-v3/README.md`](lab/openplc-v3/README.md)。
 
+## Vulnerability Reproduction Module
+
+`modbus-cli vuln` 是獨立的漏洞重現與驗證模組。它不同於一般封包產生、協定測試及 fuzzing：每個案例都有隔離環境條件、baseline、實際動作紀錄、系統觀測、證據式 verdict 與復原驗證；既有命令路徑不含 CVE 特例，也不會自動選擇或執行案例。
+
+目前內建案例為 `CVE-2025-53476`：OpenPLC_v3 revision `a931181e8b81e36fadf7b74d5cba99b73c3f6d58` 的 ModbusTCP connection resource exhaustion。
+
+安全模型是 fail-closed：沒有任意 `--target`，只接受自己新建且標記為 `modbus-cli.vulnerability-case` 的 Docker 容器；Compose 使用案例專用 bridge network，且所有 host port 僅映射至 `127.0.0.1`，並限制 CPU、記憶體、PID 與容器內 `nofile`。不使用 host network、不改宿主機 `ulimit`/sysctl/firewall，也不會刪除現有專案容器或 network。每個連線（包括零 payload connect）都會留下 evidence。
+
+標準生命週期為：載入案例 → 安全檢查 → 驗證環境 → 建立隔離 target → baseline → trigger → 觀測與合法 Modbus probe → 證據判定 → cleanup → 新容器 recovery probe → report。任何階段失敗後都會進入 cleanup。
+
+結果可能是 `REPRODUCED`、`NOT_REPRODUCED`、`INCONCLUSIVE`、`ENVIRONMENT_ERROR`、`SAFETY_ABORTED`、`EXECUTION_ERROR` 或 `RECOVERY_FAILED`。`REPRODUCED` 必須同時有穩定 baseline、明確 FD/socket 資源累積、合法 probe 劣化、仍存活的 target，及以全新容器完成的復原；單一 timeout 絕不會直接算重現。
+
+```bash
+tool vuln list
+tool vuln info CVE-2025-53476
+
+# 不建立容器：顯示 revision、預計容器/network、步驟、timeout 與安全限制
+tool vuln run CVE-2025-53476 --dry-run --report-dir ./reports --json
+
+# Docker daemon 可用時的實際驗證與執行
+tool vuln validate CVE-2025-53476 --environment docker --report-dir ./reports
+tool vuln run CVE-2025-53476 \
+  --environment docker --report-dir ./reports --timeout 120 \
+  --max-connections 800 --batch-size 16 --probe-interval 0.1 \
+  --connection-delay 0 --verbose --json
+
+# 只調整本案例專用 target container，不改 host
+tool vuln run CVE-2025-53476 \
+  --target-nofile 96 --safety-reserve 2 \
+  --max-connections 800 --verbose
+
+# 預設就是貼近 advisory 的 no-payload connect/wait/client-close 策略
+tool vuln run CVE-2025-53476 \
+  --trigger-strategy advisory \
+  --max-connections 800 --verbose
+
+# OpenPLC v3 專用：重現舊腳本的 FC16 huge payload 路徑
+tool vuln run CVE-2025-53476 \
+  --trigger-strategy huge-payload \
+  --max-connections 32 --verbose --json
+```
+
+`--max-connections` 是 bounded lifecycle 嘗試上限，仍會被案例絕對上限夾住；同時開啟或保留的 client socket 另由 `active_connection_limit = RLIMIT_NOFILE - baseline descriptors - safety reserve` 控制，並寫入 dry-run 與報告。這個分離是為了符合 CVE-2025-53476 advisory：多輪 no-payload connect/wait/client-close 可能重用 client fd，但 server 端 `CLOSE_WAIT`/fd 會逐步累積。`--target-nofile` 只會改本案例建立的 OpenPLC container `nofile`，允許範圍是 32..128；`--safety-reserve` 只會改本案例的 descriptor reserve，允許範圍是 1..32。`--trigger-strategy advisory` 只使用 no-payload connect、等待、client close，最後保留一條 no-payload socket；`mixed` 可用來少量混入 incomplete MBAP header 作比較，但不是預設。`--keep-environment` 只能保留本案例專用 Compose project；正常完成會刪除容器、network 與暫存狀態。
+
+`--trigger-strategy huge-payload` 是 OpenPLC v3 隔離案例專用，移植舊腳本的
+FC16 Write Multiple Registers malformed payload：quantity 200..2000、實際 body 為
+`quantity * 2` bytes、1-byte `byte_count` 依舊 wrap，MBAP length 宣告完整 oversized
+PDU。這條路徑不走一般 `fuzz --execute`，也不接受任意 target；verdict 會依 baseline
+穩定性、huge payload 後合法 Modbus probe 劣化、target process 狀態、FD/socket 指標和
+fresh recovery 判定。
+
+每次 run 產生 `reports/<timestamp>_CVE-2025-53476/`。先讀 `summary.json` 的 verdict；`network-actions.jsonl` 保存完整 ADU/PDU、MBAP 欄位、回應和 socket error；`observations.jsonl` 是 timestamped FD/thread/socket/CPU/memory 序列（無法取得明確標為 `unavailable`）；`openplc.log`、`runner.log`、`timeline.jsonl` 與 `report.md` 提供人類與程式可讀的完整證據。
+
+新增案例時，在 `src/modbus_cli/vulnerability_reproduction/cases/<case>/` 放置 `manifest.yaml` 與 `VulnerabilityCase` 插件，並在 registry 的內建載入點註冊。manifest 只描述產品、版本、限制和 required observations；網路操作與 verifier 留在 case 類別。新 verifier 應保存正常與異常證據、區分 `NOT_REPRODUCED` 和 `INCONCLUSIVE`，並以 fake socket/假環境涵蓋 timeout、中斷、cleanup 和 recovery；不得改變既有 `build`、`send`、`fuzz` 或 scan 的語意來遷就案例。
+
 ## 開發與測試
 
 ```bash

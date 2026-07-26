@@ -33,6 +33,7 @@ from .plugins import discover, validate
 from .protocol import decode_adu, encode_adu
 from .safety import SafetyPolicy
 from .transport import TCPTransport
+from .vulnerability_reproduction import cli as vulnerability_cli
 from .workflow import load_scan_target, verify_modbus_endpoint
 
 DEFAULT_CONFIG = Path.home() / ".config/modbus-cli/config.toml"
@@ -63,6 +64,7 @@ def parser() -> argparse.ArgumentParser:
     )
     root.add_argument("--version", action="version", version=__version__)
     commands = root.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    vulnerability_cli.add_parser(commands)
     commands.add_parser("version", help="show the version as JSON")
     commands.add_parser("info", help="show runtime, transport, strategy, and plugin information")
     scan = commands.add_parser(
@@ -456,6 +458,8 @@ def _print_fuzz_progress(event: FuzzProgressEvent, case: FuzzCase) -> None:
 
 
 def run(ns: argparse.Namespace) -> Any:
+    if ns.command == "vuln":
+        return vulnerability_cli.run(ns)
     if ns.command == "version":
         return {"version": __version__}
     if ns.command == "info":
