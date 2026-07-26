@@ -1,6 +1,6 @@
-"""Independent OpenPLC Runtime fingerprinting toolkit."""
+"""OpenPLC Runtime fingerprinting and PLC service discovery toolkit."""
 
-from .model import Observation, ProbeState, ScanReport
+from .model import Observation, PortFinding, ProbeState, ScanReport
 
-__all__ = ["Observation", "ProbeState", "ScanReport"]
+__all__ = ["Observation", "PortFinding", "ProbeState", "ScanReport"]
 __version__ = "0.1.0"

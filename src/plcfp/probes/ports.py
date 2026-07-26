@@ -6,9 +6,10 @@ import time
 
 from plcfp.model import Observation, ProbeState
 from plcfp.net import ResolvedTarget, socket_address
+from plcfp.port_services import DEFAULT_DISCOVERY_TCP_PORTS
 from plcfp.scheduler import BudgetExceeded, ProbeScheduler
 
-DEFAULT_TCP_PORTS = (502, 8080, 8443, 44818, 20000, 4840)
+DEFAULT_TCP_PORTS = DEFAULT_DISCOVERY_TCP_PORTS
 
 
 def probe_tcp_ports(
@@ -55,6 +56,7 @@ def probe_tcp_ports(
                 state=state,
                 latency_ms=round(latency, 3),
                 error=error,
+                metadata={"port": port, "transport": "tcp"},
             )
         )
     return observations

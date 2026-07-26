@@ -1,11 +1,12 @@
 # Modbus Lab CLI
 
-這個 repository 提供兩個彼此獨立的命令列工具：
+這個 repository 以 `modbus-cli` 提供整合的 PLC 服務掃描、Modbus TCP 封包操作與 fuzz
+工作流；`plcfp` 保留為相容的進階 OpenPLC 指紋入口：
 
 | 工具 | 用途 | 適合情境 |
 | --- | --- | --- |
-| `modbus-cli` | 建立、解析、傳送 Modbus TCP 封包，以及產生受限的 fuzz corpus | 協定教學、封包驗證、隔離實驗室測試 |
-| `plcfp` | 以多協定證據判別 OpenPLC Runtime v3/v4 | OpenPLC 資產辨識、版本證據採集 |
+| `modbus-cli` | 掃描 PLC/ICS 服務、建立/解析/傳送 Modbus TCP 封包，以及受限 fuzz | 資產辨識、封包驗證、隔離實驗室測試 |
+| `plcfp` | `scan` 的進階/相容入口，以及離線 PCAP 分析 | OpenPLC 版本證據採集 |
 
 兩個工具都只應用在你擁有或明確獲准測試的隔離環境。請勿連到生產 PLC、公共 IP，或任何
 可能控制實體設備的網路。
@@ -44,6 +45,10 @@ python -m pip install -e '.[dev]'
 
 ## 五分鐘開始使用 `modbus-cli`
 
+若要直接使用整合後的「多端口掃描 → 保存 JSON → 離線 fuzz → 審查後執行」流程，請見
+[`docs/scan-to-fuzz.md`](docs/scan-to-fuzz.md)；該指南包含完整參數、輸出欄位、非標準埠、
+狀態判讀、錯誤排查及可直接複製的端到端範例。
+
 先用完全離線的指令熟悉封包格式。以下指令不會連線：
 
 ```bash
@@ -76,6 +81,19 @@ modbus-cli read holding-registers \
   --quantity 10
 ```
 
+也可以先由整合掃描器找出並標記 PLC 相關服務：
+
+```bash
+modbus-cli scan \
+  --target 192.168.56.10 \
+  --ports 22,80,102,502,1217,4840,8080,11740,44818 \
+  --format text
+```
+
+人類可讀表格會把高 PLC 關聯埠標為 `HIGH`，並分開顯示 `port-hint`、`configured` 與
+`confirmed`。只有實際協定 probe 成功才會標成 `confirmed`；開放 502/tcp 本身不等於已確認
+Modbus。
+
 其中：
 
 - `--target` 是單一 PLC 或模擬器的 IP/hostname，不接受網段。
@@ -101,9 +119,10 @@ modbus-cli probe --target 192.168.56.10 --port 502 --unit-id 1
 | `config`、`plugins`、`minimize` | 否 | 本機檔案或套件資訊處理 |
 | `write ... --dry-run` | 否 | 只顯示預計寫入的 request |
 | `read`、`probe`、`send` | **是** | 呼叫後立即連線並送出封包 |
+| `scan` | **是** | 對預設 PLC/ICS TCP 埠與 `--ports` 指定埠做連線/安全協定探測 |
 | `fuzz` | 否 | 預設只產生 corpus/report |
 | `fuzz --execute` | **是** | 逐一送出產生的 fuzz cases |
-| `replay` | **是** | 讀取案例後立即重送，不需要額外的 `--execute` |
+| `replay` | **是** | 唯讀安全檢查通過後立即重送，不需要額外的 `--execute` |
 | `write ... --confirm` | 目前不會 | 預設 policy 仍會拒絕所有實際寫入 |
 
 預設只允許 loopback 與 RFC1918 私有位址：
@@ -114,6 +133,8 @@ modbus-cli probe --target 192.168.56.10 --port 502 --unit-id 1
 - `192.168.0.0/16`
 
 hostname 會先解析成 IPv4 再套用限制。這不是授權機制；使用者仍需自行確認測試範圍。
+`fuzz --execute` 與 `replay` 的唯讀安全檢查不會套用到 expert-level `send`；`send` 會原樣
+傳送使用者提供的 ADU，包含寫入功能碼，因此使用前必須先用 `decode` 完整審查。
 
 ## 常見操作
 
@@ -182,6 +203,31 @@ modbus-cli fuzz \
   --output artifacts/fuzz-report.json
 ```
 
+若先保存 JSON 掃描報告，fuzz 可安全接手唯一一個「已確認且可 fuzz」的 Modbus/TCP 埠：
+
+```bash
+modbus-cli scan \
+  --target 192.168.56.10 \
+  --modbus-port 1502 \
+  --output artifacts/scan-report.json
+
+modbus-cli fuzz \
+  --scan-report artifacts/scan-report.json \
+  --unit-id 1 \
+  --strategy boundary \
+  --strategy semantic \
+  --requests 10 \
+  --interval 1 \
+  --seed 12345 \
+  --output artifacts/fuzz-review.json
+```
+
+若報告沒有 confirmed Modbus、掃描因 network-action budget 中止，或有多個候選卻未用 `--port`
+消歧義，handoff 會 fail closed。沒有 `--execute` 時仍只產生 corpus。
+報告驅動的 `--execute` 會先以相同 `--unit-id` 多送一個唯讀 FC03 protocol-correlation
+preflight，成功後等待一個 fuzz interval；
+只有 request/response correlation 通過後才會送 fuzz cases。
+
 沒有 `--execute` 時只產生 JSON，不會送出案例。即使是離線產生，`--target` 仍必須能解析且
 位於允許的私有網段，因為目標會寫入 report。
 
@@ -189,13 +235,19 @@ modbus-cli fuzz \
 
 ```bash
 modbus-cli fuzz \
-  --target 192.168.56.10 \
+  --scan-report artifacts/scan-report.json \
+  --unit-id 1 \
+  --strategy boundary \
+  --strategy semantic \
   --requests 10 \
-  --interval 0.5 \
+  --interval 1 \
   --seed 12345 \
   --output artifacts/executed-report.json \
   --execute
 ```
+
+`--execute` 不會讀取前一個 corpus 檔，而是依相同 scan report、Unit ID、策略順序、案例數
+與 seed 重建同一組 deterministic cases；這些參數必須與人工審查時一致。
 
 執行時終端會逐案顯示突變後實際送出的 request 類型，以及目標實際回傳的 normal、
 exception、malformed 或 no-packet 類型，例如：
@@ -210,6 +262,8 @@ exception、malformed 或 no-packet 類型，例如：
 
 同一個 seed、策略順序與案例數會產生相同 request。`--rate 10` 表示每秒最多 10 個 request；
 `--interval 0.5` 表示每次傳送間隔 0.5 秒，兩者不能同時使用。
+主動執行只允許單一且長度一致的 MBAP ADU；寫入功能碼、串接 ADU、非 MEI 0x0E 的 FC43，
+以及 `length` strategy 產生的畸形 framing 都會保留為 blocked case，但不會送出。
 
 ### 重播與最小化案例
 
@@ -230,8 +284,14 @@ replay。
 
 ## OpenPLC v3/v4 版本探測
 
-`plcfp` 與 `modbus_cli` 沒有 import 關係。它一次只接受一個 target，以安全分級、硬性封包
-預算和證據鏈判別 OpenPLC Runtime v3/v4，也可以離線分析 PCAP。
+`modbus-cli scan` 整合了 `plcfp` 的主動探測；獨立的 `plcfp` 指令仍可直接使用。兩者一次
+只接受一個 target，以安全分級、硬性 network-action 預算和證據鏈判別 OpenPLC Runtime
+v3/v4；
+`plcfp` 也可以離線分析 PCAP。
+
+歷史參數名稱 `--packet-budget` 與 JSON 欄位 `packets_sent` 計算的是 scheduler 執行的網路
+probe/action，不是封包擷取中可見的 TCP/IP packet 數；一次 HTTP、TLS 或 TCP action 可能
+產生多個 wire packets。
 
 ```bash
 # 檢查內建簽章資料庫
@@ -283,6 +343,7 @@ pytest --cov=modbus_cli --cov-report=term-missing
 
 其他開發文件：
 
+- [`docs/scan-to-fuzz.md`](docs/scan-to-fuzz.md)：PLC 端口掃描與 scan → fuzz 完整操作指南
 - [`docs/architecture.md`](docs/architecture.md)：程式邊界與架構
 - [`docs/fuzzing.md`](docs/fuzzing.md)：fuzz 策略與結果判讀
 - [`docs/plugin-development.md`](docs/plugin-development.md)：插件開發
