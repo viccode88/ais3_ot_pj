@@ -12,6 +12,12 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from plcfp.port_services import parse_port_spec
+from plcfp.report import render_csv, render_json, render_sarif, render_text
+from plcfp.scan import ScanOptions, scan_target
+from plcfp.scheduler import ScanProfile
+from plcfp.sigdb import SignatureError
+
 from . import __version__
 from .exceptions import ModbusCLIError
 from .fuzzing import (
@@ -20,12 +26,14 @@ from .fuzzing import (
     FuzzCase,
     FuzzProgressEvent,
     execute_cases,
+    fuzz_payload_safety_reason,
     save_cases,
 )
 from .plugins import discover, validate
 from .protocol import decode_adu, encode_adu
 from .safety import SafetyPolicy
 from .transport import TCPTransport
+from .workflow import load_scan_target, verify_modbus_endpoint
 
 DEFAULT_CONFIG = Path.home() / ".config/modbus-cli/config.toml"
 
@@ -57,6 +65,57 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", required=True, metavar="COMMAND")
     commands.add_parser("version", help="show the version as JSON")
     commands.add_parser("info", help="show runtime, transport, strategy, and plugin information")
+    scan = commands.add_parser(
+        "scan",
+        help="discover PLC-related TCP services and produce a fuzz-compatible report",
+    )
+    scan.add_argument(
+        "--target",
+        required=True,
+        metavar="HOST",
+        help="authorized private/loopback IPv4 target or hostname",
+    )
+    scan.add_argument(
+        "--profile",
+        choices=[profile.value for profile in ScanProfile],
+        default=ScanProfile.SAFE.value,
+        help="probe intensity (default: safe)",
+    )
+    scan.add_argument(
+        "--max-layer",
+        type=int,
+        choices=(1, 2, 3, 4),
+        default=2,
+        help="highest active probe layer (default: 2)",
+    )
+    scan.add_argument("--timeout", type=float, metavar="SEC", help="per-probe timeout")
+    scan.add_argument("--scan-interval", type=float, metavar="SEC", help="delay between probes")
+    scan.add_argument(
+        "--packet-budget",
+        type=int,
+        metavar="COUNT",
+        help="hard scan network-action limit (legacy option name)",
+    )
+    scan.add_argument(
+        "--ports",
+        metavar="SPEC",
+        help="additional TCP ports/ranges, for example 22,80,102,500-510",
+    )
+    scan.add_argument("--modbus-port", type=int, default=502)
+    scan.add_argument("--v3-http-port", type=int, default=8080)
+    scan.add_argument("--v4-https-port", type=int, default=8443)
+    scan.add_argument("--enip-port", type=int, default=44818)
+    scan.add_argument("--dnp3-port", type=int, default=20000)
+    scan.add_argument("--opcua-port", type=int, default=4840)
+    scan.add_argument(
+        "--dnp3-address",
+        type=int,
+        help="lab profile only; enables a DNP3 Link Status request",
+    )
+    scan.add_argument("--signature-dir", type=Path)
+    scan.add_argument("--format", choices=("json", "text", "csv", "sarif"), default="json")
+    scan.add_argument("--output", type=Path, metavar="PATH", help="optional scan report path")
+    scan.add_argument("--no-raw", action="store_true", help="omit raw responses from JSON")
     build = commands.add_parser("build", help="build a Modbus TCP ADU without transmitting it")
     _packet_args(build)
     build.add_argument(
@@ -138,7 +197,31 @@ def parser() -> argparse.ArgumentParser:
     fuzz = commands.add_parser(
         "fuzz", help="generate or explicitly execute deterministic fuzz cases"
     )
-    _common_target(fuzz)
+    fuzz_target = fuzz.add_mutually_exclusive_group(required=True)
+    fuzz_target.add_argument(
+        "--target",
+        metavar="HOST",
+        help="authorized private/loopback IPv4 target or hostname",
+    )
+    fuzz_target.add_argument(
+        "--scan-report",
+        type=Path,
+        metavar="PATH",
+        help="select a confirmed Modbus/TCP port from a JSON scan report",
+    )
+    fuzz.add_argument(
+        "--port",
+        type=int,
+        metavar="PORT",
+        help="TCP port (direct target default: 502; disambiguates a scan report)",
+    )
+    fuzz.add_argument(
+        "--timeout",
+        type=float,
+        default=1.5,
+        metavar="SEC",
+        help="connect/read timeout in seconds (default: 1.5)",
+    )
     fuzz.add_argument("--unit-id", type=int, default=1, metavar="ID", help="unit ID (default: 1)")
     fuzz.add_argument(
         "--strategy",
@@ -205,9 +288,9 @@ def parser() -> argparse.ArgumentParser:
     replay.add_argument(
         "--interval",
         type=float,
-        default=0,
+        default=0.02,
         metavar="SEC",
-        help="seconds between replays (default: 0)",
+        help="seconds between replays (default: 0.02; maximum rate: 50/s)",
     )
     minimize = commands.add_parser("minimize", help="create a structural baseline from a case")
     minimize.add_argument("case", type=Path, metavar="CASE", help="case object or report array")
@@ -355,6 +438,14 @@ def _print_fuzz_progress(event: FuzzProgressEvent, case: FuzzCase) -> None:
             flush=True,
         )
         return
+    if case.status == "blocked":
+        print(
+            f"[{case.case_id}] BLOCKED request-type={_fuzz_request_type(case)}; "
+            f"reason={case.safety_reason}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
     elapsed = f"{case.elapsed_ms:.3f}" if case.elapsed_ms is not None else "unavailable"
     print(
         f"[{case.case_id}] RX response-type={_fuzz_response_type(case)}; "
@@ -376,6 +467,52 @@ def run(ns: argparse.Namespace) -> Any:
             "plugins": [asdict(p) for p in discover()],
             "default_config": str(DEFAULT_CONFIG),
         }
+    if ns.command == "scan":
+        if ns.dnp3_address is not None and ns.profile != ScanProfile.LAB.value:
+            raise ValueError("--dnp3-address requires --profile lab")
+        target = SafetyPolicy().validate_target(ns.target)
+        report = scan_target(
+            target,
+            ScanOptions(
+                profile=ScanProfile(ns.profile),
+                max_layer=ns.max_layer,
+                interval=ns.scan_interval,
+                packet_budget=ns.packet_budget,
+                timeout=ns.timeout,
+                allow_public=False,
+                dnp3_address=ns.dnp3_address,
+                signature_dir=ns.signature_dir,
+                modbus_port=ns.modbus_port,
+                v3_http_port=ns.v3_http_port,
+                v4_https_port=ns.v4_https_port,
+                enip_port=ns.enip_port,
+                dnp3_port=ns.dnp3_port,
+                opcua_port=ns.opcua_port,
+                additional_ports=parse_port_spec(ns.ports) if ns.ports is not None else (),
+            ),
+        )
+        ns._scan_status = report.status
+        rendered = {
+            "json": lambda: render_json(report, include_raw=not ns.no_raw),
+            "text": lambda: render_text(report),
+            "csv": lambda: render_csv(report),
+            "sarif": lambda: render_sarif(report),
+        }[ns.format]()
+        if ns.output:
+            ns.output.parent.mkdir(parents=True, exist_ok=True)
+            ns.output.write_text(
+                rendered + ("\n" if not rendered.endswith("\n") else ""),
+                encoding="utf-8",
+            )
+            return {
+                "target": report.target,
+                "resolved_address": report.resolved_address,
+                "status": report.status,
+                "port_summary": report.port_summary,
+                "format": ns.format,
+                "report": str(ns.output),
+            }
+        return report.to_dict(include_raw=not ns.no_raw) if ns.format == "json" else rendered
     if ns.command == "build":
         packet = _packet(ns)
         if ns.output == "binary":
@@ -434,47 +571,87 @@ def run(ns: argparse.Namespace) -> Any:
             raise ValueError("writes are disabled by the default safety policy")
     if ns.command == "fuzz":
         policy = SafetyPolicy()
-        host = policy.validate_target(ns.target)
+        selected = None
+        if ns.scan_report:
+            selected = load_scan_target(ns.scan_report, requested_port=ns.port)
+            host, port, target_source = selected.host, selected.port, selected.source
+        else:
+            host = policy.validate_target(ns.target)
+            port = 502 if ns.port is None else ns.port
+            target_source = "direct"
+        ns.port = port
         _validate_transport_options(ns)
         if ns.interval is not None and ns.interval <= 0:
             raise ValueError("interval must be > 0")
         rate = 1 / ns.interval if ns.interval is not None else ns.rate
         policy.validate_fuzz(ns.requests, rate, ns.concurrency)
+        interval = ns.interval if ns.interval is not None else 1 / rate
+        if ns.execute and selected is not None:
+            verify_modbus_endpoint(selected, ns.timeout, ns.unit_id)
+            # Treat the report preflight as part of the paced network sequence.
+            time.sleep(interval)
         strategies = ns.strategy or ["boundary"]
         generator = CaseGenerator(ns.seed)
         cases = [
-            generator.generate(i + 1, strategies[i % len(strategies)], ns.unit_id, host, ns.port)
+            generator.generate(i + 1, strategies[i % len(strategies)], ns.unit_id, host, port)
             for i in range(ns.requests)
         ]
-        interval = ns.interval if ns.interval is not None else 1 / rate
         execute_cases(cases, ns.timeout, interval, _print_fuzz_progress) if ns.execute else None
         save_cases(ns.output, cases)
         return {
             "seed": ns.seed,
             "cases": len(cases),
             "executed": ns.execute,
+            "executed_cases": sum(case.sent_at is not None for case in cases),
+            "blocked_cases": sum(case.status == "blocked" for case in cases),
             "interval": interval,
+            "target": {"host": host, "port": port, "source": target_source},
+            "preflight_verified": ns.execute and selected is not None,
             "report": str(ns.output),
         }
     if ns.command == "replay":
-        if ns.interval < 0:
-            raise ValueError("interval must be >= 0")
+        policy = SafetyPolicy()
+        if ns.interval <= 0:
+            raise ValueError("interval must be > 0")
+        policy.validate_fuzz(ns.times, 1 / ns.interval, 1)
         raw = json.loads(ns.case.read_text())
-        case = raw[0] if isinstance(raw, list) else raw
-        host = SafetyPolicy().validate_target(case["target"]["host"])
+        if isinstance(raw, list):
+            if not raw:
+                raise ValueError("replay report array must contain at least one case")
+            case = raw[0]
+        else:
+            case = raw
+        if not isinstance(case, dict):
+            raise ValueError("replay case must be a JSON object")
+        case_id = case.get("case_id")
+        request_hex = case.get("request_hex")
+        if not isinstance(case_id, str) or not case_id:
+            raise ValueError("replay case_id must be a non-empty string")
+        if not isinstance(request_hex, str):
+            raise ValueError("replay request_hex must be a string")
+        case_target = case.get("target")
+        if not isinstance(case_target, dict):
+            raise ValueError("replay case target must be a JSON object")
+        host_value = case_target.get("host")
+        port_value = case_target.get("port")
+        if not isinstance(host_value, str):
+            raise ValueError("replay target.host must be a string")
+        if isinstance(port_value, bool) or not isinstance(port_value, int):
+            raise ValueError("replay target.port must be an integer")
+        host = policy.validate_target(host_value)
+        ns.port = port_value
+        _validate_transport_options(ns)
+        payload = bytes.fromhex(request_hex)
+        safety_reason = fuzz_payload_safety_reason(payload)
+        if safety_reason is not None:
+            raise ValueError(f"replay blocked by fuzz safety policy: {safety_reason}")
         results = []
         for index in range(ns.times):
-            results.append(
-                asdict(
-                    TCPTransport(host, int(case["target"]["port"]), ns.timeout).exchange(
-                        bytes.fromhex(case["request_hex"])
-                    )
-                )
-            )
+            results.append(asdict(TCPTransport(host, ns.port, ns.timeout).exchange(payload)))
             if ns.interval and index < ns.times - 1:
                 time.sleep(ns.interval)
         return {
-            "case_id": case["case_id"],
+            "case_id": case_id,
             "results": results,
             "stable": len({r["status"] for r in results}) == 1,
         }
@@ -533,6 +710,11 @@ def main(argv: list[str] | None = None) -> int:
                 if isinstance(output, str)
                 else json.dumps(output, indent=2, default=lambda value: None)
             )
+        if ns.command == "scan" and getattr(ns, "_scan_status", None) in {
+            "CONFLICT",
+            "BUDGET_EXCEEDED",
+        }:
+            return 3
         return 0
     except (
         ModbusCLIError,
@@ -541,6 +723,7 @@ def main(argv: list[str] | None = None) -> int:
         json.JSONDecodeError,
         tomllib.TOMLDecodeError,
         LookupError,
+        SignatureError,
     ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

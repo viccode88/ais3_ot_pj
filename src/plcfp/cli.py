@@ -8,7 +8,8 @@ from pathlib import Path
 
 from plcfp import __version__
 from plcfp.passive import analyze_pcap
-from plcfp.report import render_csv, render_json, render_sarif
+from plcfp.port_services import parse_port_spec
+from plcfp.report import render_csv, render_json, render_sarif, render_text
 from plcfp.scan import ScanOptions, scan_target
 from plcfp.scheduler import ScanProfile
 from plcfp.sigdb import SignatureError, load_signatures
@@ -17,7 +18,7 @@ from plcfp.sigdb import SignatureError, load_signatures
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
         prog="plcfp",
-        description="Independent OpenPLC v3/v4 evidence-based fingerprinting tool",
+        description="OpenPLC v3/v4 fingerprinting and PLC service discovery tool",
     )
     root.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     commands = root.add_subparsers(dest="command", required=True)
@@ -45,6 +46,11 @@ def parser() -> argparse.ArgumentParser:
     scan.add_argument("--enip-port", type=int, default=44818)
     scan.add_argument("--dnp3-port", type=int, default=20000)
     scan.add_argument("--opcua-port", type=int, default=4840)
+    scan.add_argument(
+        "--ports",
+        metavar="SPEC",
+        help="additional TCP ports/ranges, for example 22,80,102,500-510",
+    )
     scan.add_argument("--signature-dir", type=Path)
     _output_arguments(scan)
 
@@ -60,7 +66,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 def _output_arguments(command: argparse.ArgumentParser) -> None:
-    command.add_argument("--format", choices=("json", "csv", "sarif"), default="json")
+    command.add_argument("--format", choices=("json", "text", "csv", "sarif"), default="json")
     command.add_argument("--output", type=Path)
     command.add_argument(
         "--no-raw",
@@ -70,6 +76,8 @@ def _output_arguments(command: argparse.ArgumentParser) -> None:
 
 
 def _render(report: object, output_format: str, no_raw: bool) -> str:
+    if output_format == "text":
+        return render_text(report)  # type: ignore[arg-type]
     if output_format == "csv":
         return render_csv(report)  # type: ignore[arg-type]
     if output_format == "sarif":
@@ -104,6 +112,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     enip_port=args.enip_port,
                     dnp3_port=args.dnp3_port,
                     opcua_port=args.opcua_port,
+                    additional_ports=(
+                        parse_port_spec(args.ports) if args.ports is not None else ()
+                    ),
                 ),
             )
         else:

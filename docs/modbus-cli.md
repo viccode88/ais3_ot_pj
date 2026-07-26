@@ -58,6 +58,7 @@ mbfuzz build --function 3
 | --- | --- | --- |
 | `version` | 顯示 JSON 版本資訊 | 無 |
 | `info` | 顯示環境、策略與插件資訊 | 載入插件 metadata |
+| `scan` | 掃描並辨識 PLC/ICS TCP 服務 | 建立 TCP 連線並執行所選安全 probe；可寫 report |
 | `build` | 建立 Modbus TCP ADU | 無；輸出到 stdout |
 | `decode` | 解析 hex 或 binary ADU | 只讀指定檔案 |
 | `read` | 傳送 FC01–04 唯讀 request | 立即建立 TCP 連線 |
@@ -79,7 +80,7 @@ mbfuzz build --function 3
 
 ## 3. 共用網路參數
 
-`read`、`send`、`write`、`probe` 和 `fuzz` 使用以下共用參數：
+`read`、`send`、`write`、`probe` 和直接指定 target 的 `fuzz` 使用以下共用參數：
 
 | 參數 | 必填 | 預設 | 意義 |
 | --- | --- | --- | --- |
@@ -91,6 +92,67 @@ mbfuzz build --function 3
 
 預設只允許 loopback 和 RFC1918 私有位址。公網、IPv6、無法解析的 hostname 都會被拒絕。
 hostname 的 DNS 結果若不是允許的私有 IPv4，也會被拒絕。
+
+## 3A. PLC/ICS 服務掃描：`scan`
+
+完整的端口 catalog、結果欄位、非標準埠、scan report 交接、主動執行與疑難排解，請見
+[`scan-to-fuzz.md`](scan-to-fuzz.md)。
+
+**用途與副作用：**對單一已授權的私有 IPv4 掃描常見 PLC/ICS TCP 埠，再對已開放的指定
+角色埠做安全的 Modbus、EtherNet/IP、OPC UA、HTTP/TLS 等協定 probe。掃描一定會建立網路
+連線；`--output` 只是額外保存結果，不會把掃描變成離線操作。
+
+```bash
+modbus-cli scan \
+  --target 192.168.56.10 \
+  --profile safe \
+  --max-layer 2 \
+  --ports 22,80,102,502,1217,4840,8000-8010,11740,44818 \
+  --format text
+```
+
+重要參數：
+
+| 參數 | 預設 | 意義 |
+| --- | --- | --- |
+| `--target HOST` | 必填 | 私有/loopback IPv4 或可解析 hostname |
+| `--profile` | `safe` | `safe`、`standard` 或 `lab` 的探測節奏/預算 |
+| `--max-layer` | `2` | 最高主動探測層，1–4 |
+| `--ports SPEC` | 無 | 額外 TCP 逗號清單/範圍；最多展開 1024 埠 |
+| `--modbus-port` | `502` | 要做 Modbus 上層確認的角色埠 |
+| `--v3-http-port` / `--v4-https-port` | `8080` / `8443` | OpenPLC Web 候選角色埠 |
+| `--enip-port` / `--opcua-port` / `--dnp3-port` | 協定標準值 | 其他工控協定角色埠 |
+| `--packet-budget` | profile 預設 | 掃描與上層 probe 共用的硬性 network-action 上限 |
+| `--format` | `json` | `json`、`text`、`csv` 或 `sarif` |
+| `--output PATH` | stdout | 將選定格式寫到檔案，stdout 改輸出精簡摘要 |
+
+結構化 JSON 以 `port_findings` 列出 `state`、`service_id/service_name`、`plc_relevance`、
+`identification`、證據與 `fuzz_eligible`。`HIGH`/`plc_relevance=high` 是 PLC 關聯標記，
+不是確認結果；只有有效上層回應才是 `identification=confirmed`。`port_summary` 直接列出
+高相關開放埠、已確認服務與可交給 fuzz 的候選。Action budget 不足而尚未探測的埠是
+`state=not-scanned`，不會與實際探測失敗的 `unavailable` 混在一起；
+`port_summary.scan_complete` 則獨立表示整體掃描與上層 probe 是否在 network-action budget
+內完成；
+即使所有 TCP 埠已掃完，上層 probe 中途耗盡 budget 仍會是 `false`。自訂角色埠與
+`--ports` 指定埠會排在預設 catalog 埠前面，讓較小的 action budget 優先處理操作員指定
+範圍。
+
+`--packet-budget` 是沿用的 CLI 名稱：scheduler 每執行一次 connect、HTTP request、
+Modbus exchange 等高階 network action 就計數一次。它不是 wire-packet cap；一個 action
+可能產生多個 TCP/IP packets。JSON 的 `packets_sent` 欄位同樣是 action 計數。
+
+角色埠選項只移動該協定的主動 probe，不會刪除標準 catalog 埠。例如
+`--modbus-port 1502` 會在 1502 執行 Modbus 確認，但 502 仍保留 TCP connect 與
+Modbus port-hint。
+
+若要交給 fuzz，必須保存 **JSON**：
+
+```bash
+modbus-cli scan \
+  --target 192.168.56.10 \
+  --modbus-port 1502 \
+  --output artifacts/scan-report.json
+```
 
 ## 4. Modbus 位址怎麼填
 
@@ -518,7 +580,7 @@ corpus；只有明確加入 `--execute` 才會逐案建立 TCP 連線並傳送�
 
 ```bash
 modbus-cli fuzz \
-  --target HOST \
+  (--target HOST | --scan-report SCAN.json) \
   [--port PORT] \
   [--timeout SEC] \
   [--unit-id ID] \
@@ -535,8 +597,9 @@ modbus-cli fuzz \
 
 | 參數 | 必填 | 預設 | 意義 |
 | --- | --- | --- | --- |
-| `--target HOST` | 是 | 無 | 案例記錄的單一 target；即使離線產生也會解析並套用私網 allowlist |
-| `--port PORT` | 否 | `502` | 寫入案例並在 execute 時使用的 TCP port |
+| `--target HOST` | 與 `--scan-report` 二選一 | 無 | 直接指定 target；即使離線產生也會解析並套用私網 allowlist |
+| `--scan-report FILE` | 與 `--target` 二選一 | 無 | 從 JSON 報告選取 confirmed、fuzz-eligible Modbus/TCP 埠 |
+| `--port PORT` | 否 | 直接 target 為 `502` | 直接指定目的埠；或在報告有多個合格候選時消歧義 |
 | `--timeout SEC` | 否 | `1.5` | 每個 execute case 的 TCP connect/read timeout |
 | `--unit-id ID` | 否 | `1` | 產生 baseline request 時使用的 Unit ID |
 | `--strategy STRATEGY` | 否，可重複 | 實際使用 `boundary` | 九種策略之一；多次指定時依順序循環 |
@@ -574,6 +637,28 @@ modbus-cli fuzz \
 
 若指定多個 `--strategy`，案例會依指定順序循環產生。
 
+也可以讓掃描報告提供 target 與 port：
+
+```bash
+modbus-cli fuzz \
+  --scan-report artifacts/scan-report.json \
+  --requests 20 \
+  --output artifacts/fuzz-report.json
+```
+
+報告被視為不可信輸入：工具會重新驗證 `resolved_address`、要求
+`port_summary.scan_complete=true` 與已知的終態分類，並交叉檢查綁定同一 TCP 埠的
+`protocol_valid` Modbus observation；只有
+`open + modbus-tcp + confirmed + fuzz_eligible` 才能成為候選。`INCONCLUSIVE` 只表示未辨認
+出 OpenPLC 世代，不會阻擋已嚴格確認的 Modbus 埠。沒有候選或有多個候選但未指定
+`--port` 時會拒絕，不會退回猜測 502。
+
+搭配 `--scan-report --execute` 時，在第一個 fuzz case 前還會用相同 `--unit-id` 發出一次
+唯讀 FC03 protocol-correlation preflight，重新確認目前 endpoint 的 Modbus
+request/response correlation；合法 exception 也可通過，因此它不代表應用程式健康。
+preflight 失敗時不會傳送 fuzz cases；因此這種執行方式會比 `--requests` 多一個唯讀網路
+request。成功後會等待一個 fuzz interval 才送第一個 case，避免略過設定的 pacing。
+
 ### 12.2 支援策略
 
 | strategy | 修改內容 |
@@ -594,13 +679,14 @@ modbus-cli fuzz \
 
 | 參數 | 意義 | 限制 |
 | --- | --- | --- |
-| `--requests N` | 案例數 | 1–10000 |
+| `--requests N` | Fuzz 案例數 | 1–10000；report execute 另有 1 個 preflight |
 | `--rate R` | 每秒最多幾個 request | 大於 0、最多 50；預設 10 |
 | `--interval SEC` | 相鄰 request 的等待秒數 | 大於 0 |
 | `--concurrency N` | 安全限制欄位 | 1–4；目前 executor 仍是循序傳送 |
 | `--seed N` | deterministic PRNG seed | 預設 1 |
 
-`--rate` 和 `--interval` 不能同時指定。`--interval 0.5` 相當於每秒最多 2 個 request。
+`--rate` 和 `--interval` 不能同時指定。`--interval 0.5` 相當於每秒最多 2 個 fuzz
+requests；report-driven preflight 與第一個 case 之間也會等待 0.5 秒。
 
 ### 12.4 顯式執行
 
@@ -608,7 +694,8 @@ modbus-cli fuzz \
 
 ```bash
 modbus-cli fuzz \
-  --target 192.168.56.10 \
+  --scan-report artifacts/scan-report.json \
+  --unit-id 1 \
   --requests 10 \
   --strategy boundary \
   --interval 1 \
@@ -616,6 +703,10 @@ modbus-cli fuzz \
   --output artifacts/executed-report.json \
   --execute
 ```
+
+這個命令會先執行 report handoff 驗證與一個唯讀 FC03 preflight。`--execute` 會按照參數
+重新產生案例，不會讀取先前的 fuzz corpus；若要執行已人工審查的 deterministic cases，
+scan report、Unit ID、策略順序、案例數與 seed 必須保持一致。
 
 使用 `--execute` 時，每個案例會把即時進度寫到 **stderr**。`TX` 顯示突變後實際送出的
 功能類型、目的地與策略；`RX` 顯示實際 response 類型、transport 狀態、延遲與保守分類。
@@ -631,6 +722,17 @@ modbus-cli fuzz \
 `malformed-request (function code unavailable)`。功能碼最高 bit 被設為 1 時會附上
 `exception-bit-set`，framing 有警告時會附上 `malformed framing`。不能假定所有案例都是
 baseline FC03。
+
+突變後的實際 payload 在建立 socket 前還會再套用唯讀功能碼 allowlist，並要求恰好一個
+完整 MBAP ADU（protocol ID 0、宣告長度與實際長度一致、不得尾隨或串接第二個 ADU）。
+FC43 只允許完整的 MEI 0x0E Read Device Identification；可讀寫的其他 MEI subtype 會封鎖。
+FC05、FC06、FC15、FC16、未知功能碼或無法安全判定 framing 的 request 會保留在 report，但標為
+`status=blocked`、`classification=blocked-by-safety-policy`，不會傳送。stderr 會顯示
+`BLOCKED`，stdout 摘要中的 `executed_cases` 與 `blocked_cases` 可用來核對實際結果。
+
+因此 `length` strategy 適合離線 corpus/decoder 測試；其刻意不一致的 MBAP length 在
+`--execute` 時會被 transport boundary 封鎖。`bitflip`、`byteflip` 或 `random` 若改到
+MBAP framing，也會同樣保留案例但不送出。
 
 如果 transport 沒有回傳任何 bytes，CLI 不會虛構 Modbus response 類型，而會顯示
 `response-type=no-packet`，並保留真正的 transport 狀態與分類：
@@ -674,7 +776,15 @@ stdout 摘要維持以下欄位：
   "seed": 1,
   "cases": 10,
   "executed": true,
+  "executed_cases": 10,
+  "blocked_cases": 0,
   "interval": 1.0,
+  "target": {
+    "host": "192.168.56.10",
+    "port": 502,
+    "source": "direct"
+  },
+  "preflight_verified": false,
   "report": "artifacts/executed-report.json"
 }
 ```
@@ -690,6 +800,7 @@ stdout 摘要維持以下欄位：
 | `possible-service-degradation` | 本次案例 timeout，需要 health check 和重播確認 |
 | `anomalous-transport` | connection error、disconnect 等傳輸異常 |
 | `possible-parser-inconsistency` | 收到的 response 有結構警告 |
+| `blocked-by-safety-policy` | 突變後不是明確唯讀 request，未建立 socket |
 | `inconclusive` | 尚未執行或證據不足 |
 
 ### 12.5 輸出與副作用
@@ -703,8 +814,9 @@ stdout 摘要維持以下欄位：
 
 ## 13. 重播：`replay`
 
-**用途與副作用：**從 fuzz case JSON 讀取已保存的 target 與 `request_hex`，不經第二次確認就
-立即重送。輸入若是 array，只使用第一筆 case。
+**用途與副作用：**從 fuzz case JSON 讀取已保存的 target 與 `request_hex`；通過相同的 fuzz
+唯讀功能碼檢查後立即重送。輸入若是 array，只使用第一筆 case。寫入、未知或無功能碼案例
+會在建立 socket 前被拒絕。
 
 語法：
 
@@ -720,9 +832,9 @@ modbus-cli replay CASE \
 | 參數 | 必填 | 預設 | 意義 |
 | --- | --- | --- | --- |
 | `CASE` | 是 | 無 | 單一 case object 或 case array 的 JSON 檔案路徑 |
-| `--times N` | 否 | `1` | 重播次數；目前 parser 只轉為整數，未額外限制範圍 |
+| `--times N` | 否 | `1` | 重播次數，範圍 1–10000 |
 | `--timeout SEC` | 否 | `1.5` | 每次 TCP exchange 的 timeout |
-| `--interval SEC` | 否 | `0` | 相鄰重播間隔，必須大於或等於 0 |
+| `--interval SEC` | 否 | `0.02` | 相鄰重播間隔，必須大於 0；最快 50 次/秒 |
 
 ### 詳細範例
 
@@ -739,9 +851,11 @@ modbus-cli replay artifacts/fuzz-report.json \
 
 重要行為：
 
-- `replay` 會立即連到 JSON 內 `target.host` 和 `target.port`，沒有第二個確認參數。
+- `replay` 會在唯讀安全檢查通過後立即連到 JSON 內 `target.host` 和 `target.port`，沒有第二個
+  確認參數。
 - 輸入可以是單一 case object 或 case array；array 只會重播第一個 case。
-- `--interval` 可以是 0；`--times` 大於 1 時控制相鄰重播的等待時間。
+- `replay` 與 fuzz 共用 1–10000 次、最高 50 次/秒的硬限制；`--interval 0` 會被拒絕。
+- 安全檢查要求單一完整 MBAP ADU，會封鎖尾隨/串接 ADU 與非 MEI 0x0E 的 FC43。
 - `stable: true` 只表示每次 transport `status` 相同，不表示問題已證實或 response 完全相同。
 
 stdout 是包含 `case_id`、`results` 和 `stable` 的 JSON。命令最多建立 `--times` 條新 TCP
@@ -924,6 +1038,7 @@ stdout JSON 會列出 CLI 版本、Python 版本、transport、fuzz strategies�
 | --- | --- |
 | `0` | command 完成；網路操作仍須檢查輸出的 `status` |
 | `2` | 參數、檔案、解析、安全策略或執行錯誤 |
+| `3` | `scan` 完成但分類衝突，或硬性 network-action budget 使掃描不完整 |
 
 範例：
 

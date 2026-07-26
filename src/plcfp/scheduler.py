@@ -34,7 +34,7 @@ PROFILE_LIMITS = {
 
 
 class ProbeScheduler:
-    """Single-target scheduler with a hard packet/action budget."""
+    """Single-target scheduler with a hard network-action budget."""
 
     def __init__(
         self,
@@ -52,7 +52,7 @@ class ProbeScheduler:
         if self.interval < 0:
             raise ValueError("interval must be >= 0")
         if self.packet_budget < 1:
-            raise ValueError("packet budget must be >= 1")
+            raise ValueError("network-action budget must be >= 1")
         if self.timeout <= 0:
             raise ValueError("timeout must be > 0")
         self.sent = 0
@@ -60,7 +60,9 @@ class ProbeScheduler:
 
     def run(self, action: Callable[[], T]) -> T:
         if self.sent >= self.packet_budget:
-            raise BudgetExceeded(f"hard packet budget exceeded ({self.sent}/{self.packet_budget})")
+            raise BudgetExceeded(
+                f"hard network-action budget exceeded ({self.sent}/{self.packet_budget})"
+            )
         if self._last_action is not None:
             remaining = self.interval - (time.monotonic() - self._last_action)
             if remaining > 0:

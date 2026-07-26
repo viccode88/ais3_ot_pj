@@ -60,6 +60,21 @@ class Evidence:
 
 
 @dataclass(slots=True)
+class PortFinding:
+    port: int
+    transport: str
+    state: str
+    service_id: str
+    service_name: str
+    plc_relevance: str
+    identification: str
+    evidence: list[str]
+    latency_ms: float | None
+    fuzz_eligible: bool = False
+    alternatives: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class ScanReport:
     target: str
     resolved_address: str | None
@@ -83,6 +98,8 @@ class ScanReport:
     started_at: str
     completed_at: str
     status: str = "complete"
+    port_findings: list[PortFinding] = field(default_factory=list)
+    port_summary: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self, include_raw: bool = True) -> dict[str, Any]:
         data = asdict(self)
@@ -90,4 +107,6 @@ class ScanReport:
         data["observations"] = [
             observation.to_dict(include_raw=include_raw) for observation in self.observations
         ]
+        data["port_findings"] = [asdict(item) for item in self.port_findings]
+        data["port_summary"] = dict(self.port_summary)
         return data

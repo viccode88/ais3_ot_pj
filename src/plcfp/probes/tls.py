@@ -89,39 +89,44 @@ def probe_tls(
         }
         observations = [
             Observation(
-                probe_id="tls.8443.certificate",
+                probe_id=f"tls.{port}.certificate",
                 feature="tls.cert",
                 value=value,
                 latency_ms=latency,
                 raw=der,
+                metadata={"port": port, "transport": "tcp", "service_id": "tls"},
             ),
             Observation(
-                probe_id="tls.8443.subject_cn",
+                probe_id=f"tls.{port}.subject_cn",
                 feature="tls.cert.subject_cn",
                 value=subject.get("commonName"),
                 latency_ms=latency,
+                metadata={"port": port, "transport": "tcp", "service_id": "tls"},
             ),
             Observation(
-                probe_id="tls.8443.validity",
+                probe_id=f"tls.{port}.validity",
                 feature="tls.cert.validity_days",
                 value=validity_days,
                 latency_ms=latency,
+                metadata={"port": port, "transport": "tcp", "service_id": "tls"},
             ),
             Observation(
-                probe_id="tls.8443.stack",
+                probe_id=f"tls.{port}.stack",
                 feature="tls.stack",
                 value={"protocol": protocol, "cipher": cipher[0] if cipher else None},
                 latency_ms=latency,
+                metadata={"port": port, "transport": "tcp", "service_id": "tls"},
             ),
         ]
         return observations
     except (OSError, ssl.SSLError, ValueError) as exc:
         return [
             Observation(
-                probe_id="tls.8443.certificate",
+                probe_id=f"tls.{port}.certificate",
                 feature="tls.cert",
                 state=ProbeState.UNAVAILABLE,
                 latency_ms=round((time.monotonic() - started) * 1000, 3),
                 error=str(exc),
+                metadata={"port": port, "transport": "tcp", "service_id": "tls"},
             )
         ]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import random
+import struct
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -26,6 +27,8 @@ STRATEGIES = (
     "random",
 )
 
+READ_ONLY_FUNCTION_CODES = frozenset({1, 2, 3, 4, 7, 11, 12, 17, 20, 24, 43})
+
 
 @dataclass
 class FuzzCase:
@@ -41,10 +44,47 @@ class FuzzCase:
     status: str = "pending"
     classification: str = "inconclusive"
     reproducible: bool | None = None
+    safety_reason: str | None = None
 
 
 FuzzProgressEvent = Literal["sending", "result"]
 FuzzProgressCallback = Callable[[FuzzProgressEvent, FuzzCase], None]
+
+
+def fuzz_payload_safety_reason(payload: bytes) -> str | None:
+    """Return why a mutated/replayed payload may not cross the fuzz transport boundary."""
+    if len(payload) < 8:
+        return "request does not contain one complete MBAP ADU and function byte"
+
+    _transaction_id, protocol_id, declared_length = struct.unpack(">HHH", payload[:6])
+    if protocol_id != 0:
+        return "MBAP protocol ID must be zero"
+    if not 2 <= declared_length <= 254:
+        return "MBAP length must describe a 2..254 byte unit-and-PDU payload"
+    expected_size = 6 + declared_length
+    if len(payload) != expected_size:
+        return (
+            f"MBAP length declares {expected_size} total bytes but request contains "
+            f"{len(payload)}; trailing, concatenated, and truncated ADUs are blocked"
+        )
+
+    function_code = payload[7]
+    if function_code not in READ_ONLY_FUNCTION_CODES:
+        return (
+            f"function code 0x{function_code:02X} is not an explicitly allowed read-only operation"
+        )
+
+    # FC43 is a multiplexed transport: MEI 0x0D can write CANopen objects.
+    # Only the exact FC43/MEI 0x0E Read Device Identification request shape is
+    # allowed through the active transport boundary.
+    if function_code == 43:
+        pdu = payload[7:]
+        if len(pdu) != 4 or pdu[1] != 0x0E or pdu[2] not in {1, 2, 3, 4}:
+            return (
+                "function code 0x2B is allowed only as a complete MEI 0x0E "
+                "Read Device Identification request"
+            )
+    return None
 
 
 class CaseGenerator:
@@ -114,12 +154,39 @@ def execute_cases(
     if interval < 0:
         raise ValueError("interval must be >= 0")
     for index, case in enumerate(cases):
+        case.sent_at = None
+        case.response_hex = None
+        case.elapsed_ms = None
+        case.safety_reason = None
+        try:
+            payload = bytes.fromhex(case.request_hex)
+        except ValueError:
+            case.status = "blocked"
+            case.classification = "blocked-by-safety-policy"
+            case.safety_reason = "request_hex is not valid hexadecimal"
+            if progress:
+                progress("result", case)
+            if interval and index < len(cases) - 1:
+                time.sleep(interval)
+            continue
+
+        safety_reason = fuzz_payload_safety_reason(payload)
+        if safety_reason is not None:
+            case.status = "blocked"
+            case.classification = "blocked-by-safety-policy"
+            case.safety_reason = safety_reason
+            if progress:
+                progress("result", case)
+            if interval and index < len(cases) - 1:
+                time.sleep(interval)
+            continue
+
         case.sent_at = datetime.now(UTC).isoformat()
         if progress:
             progress("sending", case)
         port = cast(int, case.target["port"])
         transport = TCPTransport(str(case.target["host"]), port, timeout)
-        result = transport.exchange(bytes.fromhex(case.request_hex))
+        result = transport.exchange(payload)
         case.response_hex = result.response.hex().upper() if result.response else None
         case.elapsed_ms, case.status = result.elapsed_ms, result.status
         if result.status == "timeout":

@@ -27,7 +27,9 @@ def test_scheduler_enforces_hard_budget() -> None:
 
 def test_scan_options_support_isolated_lab_port_mappings() -> None:
     options = ScanOptions(modbus_port=1502, v3_http_port=18080, enip_port=14418)
-    assert options.ports == (1502, 18080, 8443, 14418, 20000, 4840)
+    assert {1502, 18080, 8443, 14418, 20000, 4840}.issubset(options.ports)
+    assert {102, 502, 1217, 4840, 11740, 44818}.issubset(options.ports)
+    assert len(options.ports) == len(set(options.ports))
     with pytest.raises(ValueError, match="ports"):
         _ = ScanOptions(modbus_port=0).ports
 

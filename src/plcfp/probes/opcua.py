@@ -23,16 +23,32 @@ def _hello(endpoint: str) -> bytes:
 def _parse_ack(data: bytes) -> dict[str, Any]:
     if len(data) < 8:
         raise ValueError("short OPC UA TCP response")
-    message_type = data[:3].decode("ascii", errors="replace")
+    try:
+        message_type = data[:3].decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ValueError("invalid OPC UA TCP message type") from exc
     chunk_type = chr(data[3])
     size = struct.unpack_from("<I", data, 4)[0]
+    if message_type not in {"ACK", "ERR"}:
+        raise ValueError(f"unexpected OPC UA response type {message_type!r}")
+    if chunk_type != "F":
+        raise ValueError("OPC UA connection response must be a final chunk")
+    if size != len(data):
+        raise ValueError("OPC UA message size does not match received bytes")
     result: dict[str, Any] = {
         "message_type": message_type,
         "chunk_type": chunk_type,
         "message_size": size,
+        "protocol_valid": True,
     }
-    if message_type == "ACK" and len(data) >= 28:
+    if message_type == "ACK":
+        if size != 28:
+            raise ValueError("OPC UA ACK must contain the complete 28-byte structure")
         protocol, receive, send, maximum, chunks = struct.unpack_from("<IIIII", data, 8)
+        if protocol != 0:
+            raise ValueError("unsupported OPC UA protocol version in ACK")
+        if not 8192 <= receive <= 65536 or not 8192 <= send <= 65536:
+            raise ValueError("invalid OPC UA ACK buffer sizes")
         result.update(
             {
                 "protocol_version": protocol,
@@ -42,8 +58,23 @@ def _parse_ack(data: bytes) -> dict[str, Any]:
                 "max_chunk_count": chunks,
             }
         )
-    elif message_type == "ERR" and len(data) >= 12:
+    else:
+        if size < 16:
+            raise ValueError("short OPC UA ERR response")
         result["error_code"] = struct.unpack_from("<I", data, 8)[0]
+        reason_size = struct.unpack_from("<i", data, 12)[0]
+        if reason_size < -1:
+            raise ValueError("invalid OPC UA ERR reason length")
+        expected_size = 16 if reason_size == -1 else 16 + reason_size
+        if size != expected_size:
+            raise ValueError("OPC UA ERR reason length does not match message size")
+        if reason_size >= 0:
+            try:
+                result["reason"] = data[16:].decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("invalid UTF-8 in OPC UA ERR reason") from exc
+        else:
+            result["reason"] = None
     return result
 
 
@@ -72,7 +103,12 @@ def probe_opcua(
                 value=parsed,
                 latency_ms=latency,
                 raw=response,
-                metadata={"request_hex": request.hex(), "endpoint": endpoint},
+                metadata={
+                    "request_hex": request.hex(),
+                    "endpoint": endpoint,
+                    "transport": "tcp",
+                    "protocol_valid": True,
+                },
             )
         ]
     except (OSError, ValueError) as exc:
@@ -82,6 +118,11 @@ def probe_opcua(
                 feature="opcua.hello_ack",
                 state=ProbeState.UNAVAILABLE,
                 error=str(exc),
-                metadata={"request_hex": request.hex(), "endpoint": endpoint},
+                metadata={
+                    "request_hex": request.hex(),
+                    "endpoint": endpoint,
+                    "transport": "tcp",
+                    "protocol_valid": False,
+                },
             )
         ]
