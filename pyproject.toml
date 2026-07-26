@@ -14,6 +14,7 @@ dependencies = []
 [project.scripts]
 modbus-cli = "modbus_cli.cli:main"
 mbfuzz = "modbus_cli.cli:main"
+tool = "modbus_cli.cli:main"
 plcfp = "plcfp.cli:main"
 
 [project.entry-points."modbus_cli.plugins"]
@@ -23,6 +24,9 @@ dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.6", "mypy>=1.11"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/modbus_cli", "src/plcfp"]
+
+[tool.hatch.build]
+include = ["src/modbus_cli/vulnerability_reproduction/cases/**"]
 
 [tool.ruff]
 line-length = 100
