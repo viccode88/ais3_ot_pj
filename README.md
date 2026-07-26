@@ -16,9 +16,9 @@
 需求：Python 3.11 以上。
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/viccode88/ais3_ot_pj.git
 cd modbus封包產生
-python3.11 -m venv .venv
+python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e .
 ```
