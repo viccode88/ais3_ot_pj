@@ -14,7 +14,9 @@ bound protocol-valid observation, accepts only one open/confirmed/fuzz-eligible 
 and performs a read-only endpoint preflight before report-driven execution; `plcfp` never imports the
 fuzzer.
 
-At the final transmit boundary, `fuzzing.execute_cases` applies an explicit read-only function-code
-allowlist and single-complete-ADU framing check to the mutated payload. FC43 is restricted to MEI 0x0E.
-A generated case that became a write, unknown operation, malformed frame or concatenated request
-remains in the report as `blocked-by-safety-policy` and never reaches `TCPTransport`.
+The fuzzer serves reliability testing of fully virtual lab targets, so the final transmit boundary
+in `fuzzing.execute_cases` deliberately does not enforce read-only function codes or well-formed
+MBAP framing: writes, unknown operations, malformed frames, concatenated requests and oversized
+payloads all reach `TCPTransport`. Only an empty payload is recorded as `blocked-by-safety-policy`.
+The `huge-payload` strategy builds the legacy malformed FC16 oversized ADU; it is a fuzz capability,
+not part of any vulnerability case.

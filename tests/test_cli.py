@@ -166,7 +166,7 @@ def test_fuzz_execute_reports_when_target_returns_no_packet(
     assert "classification=possible-service-degradation" in captured.err
 
 
-def test_replay_blocks_mutated_write_before_transport(
+def test_replay_sends_mutated_write_to_virtual_lab(
     tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     case = {
@@ -176,18 +176,26 @@ def test_replay_blocks_mutated_write_before_transport(
     }
     report = tmp_path / "write.json"
     report.write_text(json.dumps([case]))
-    transport_calls: list[object] = []
-    monkeypatch.setattr(
-        "modbus_cli.cli.TCPTransport",
-        lambda *_args, **_kwargs: transport_calls.append(object()),
-    )
+    sent_payloads: list[bytes] = []
 
-    assert main(["replay", str(report)]) == 2
-    assert transport_calls == []
-    assert "replay blocked by fuzz safety policy" in capsys.readouterr().err  # type: ignore[attr-defined]
+    class RecordingTransport:
+        def __init__(self, *args: object) -> None:
+            pass
+
+        def exchange(self, payload: bytes) -> TransportResult:
+            sent_payloads.append(payload)
+            return TransportResult(None, 0.0, "sent")
+
+    monkeypatch.setattr("modbus_cli.cli.TCPTransport", RecordingTransport)
+
+    assert main(["replay", str(report)]) == 0
+    assert sent_payloads == [bytes.fromhex(case["request_hex"])]
+    summary = json.loads(capsys.readouterr().out)  # type: ignore[attr-defined]
+    assert summary["case_id"] == "case-write"
+    assert summary["stable"] is True
 
 
-def test_replay_blocks_concatenated_read_and_write_adus(
+def test_replay_sends_concatenated_read_and_write_adus_to_virtual_lab(
     tmp_path: Path, capsys: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     case = {
@@ -197,15 +205,22 @@ def test_replay_blocks_concatenated_read_and_write_adus(
     }
     report = tmp_path / "concatenated.json"
     report.write_text(json.dumps(case))
-    transport_calls: list[object] = []
-    monkeypatch.setattr(
-        "modbus_cli.cli.TCPTransport",
-        lambda *_args, **_kwargs: transport_calls.append(object()),
-    )
+    sent_payloads: list[bytes] = []
 
-    assert main(["replay", str(report)]) == 2
-    assert transport_calls == []
-    assert "concatenated" in capsys.readouterr().err  # type: ignore[attr-defined]
+    class RecordingTransport:
+        def __init__(self, *args: object) -> None:
+            pass
+
+        def exchange(self, payload: bytes) -> TransportResult:
+            sent_payloads.append(payload)
+            return TransportResult(None, 0.0, "sent")
+
+    monkeypatch.setattr("modbus_cli.cli.TCPTransport", RecordingTransport)
+
+    assert main(["replay", str(report)]) == 0
+    assert sent_payloads == [bytes.fromhex(case["request_hex"])]
+    summary = json.loads(capsys.readouterr().out)  # type: ignore[attr-defined]
+    assert summary["case_id"] == "case-smuggled-write"
 
 
 @pytest.mark.parametrize(

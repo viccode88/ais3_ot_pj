@@ -26,9 +26,14 @@ protocol-correlation preflight。合法的正常或 exception response 都可通
 
 ## 策略
 
-九種策略涵蓋 quantity 邊界、bit/byte flip、MBAP length、function code、transaction ID、
-Unit ID、語意不一致和隨機 byte replacement。相同 seed、策略順序和案例數會產生相同
-request，方便重現。
+十種策略涵蓋 quantity 邊界、bit/byte flip、MBAP length、function code、transaction ID、
+Unit ID、語意不一致、隨機 byte replacement，以及 huge-payload。相同 seed、策略順序和案例數
+會產生相同 request，方便重現。
+
+`huge-payload` 產生舊腳本的 FC16 Write Multiple Registers malformed payload：quantity
+200..2000、實際 body 為 `quantity * 2` bytes、1-byte `byte_count` 依舊 wrap，MBAP length 宣告
+完整 oversized PDU。這是用來測試虛擬環境解析與資源處理可靠性的 write-function、oversized
+ADU 輸入，不屬於任何 vulnerability case。
 
 ## 即時終端輸出
 
@@ -40,12 +45,11 @@ request，方便重現。
 目標未回傳封包時會顯示 `response-type=no-packet`，並以 `status` 區分 timeout、
 `connection-refused` 或其他 transport error。沒有 `--execute` 的離線模式不會顯示 TX/RX。
 
-所有 mutation 在傳輸邊界會再檢查一次實際 function code。目前只允許明確唯讀的
-FC01、02、03、04、07、11、12、17、20、24、43；寫入與未知功能碼會顯示 `BLOCKED` 並以
-`blocked-by-safety-policy` 留在 report，TCP socket 不會建立。這項檢查針對突變後 payload，
-不能由「baseline 原本是 FC03」取代。傳輸邊界只允許單一、長度完全一致的 MBAP ADU；
-FC43 也只允許 MEI 0x0E Read Device Identification。`length` strategy 的畸形 framing 可
-保留作離線 corpus，但主動執行時會被封鎖。
+這個工具服務於完全虛擬環境的可靠性測試，因此傳輸邊界刻意不做 read-only 或 framing
+檢查：過嚴的安全邊界會讓測試低弱且無效，反而讓問題流入生產環境。寫入功能碼、未知功能碼、
+串接 ADU、非 MEI 0x0E 的 FC43、`length` strategy 的畸形 framing 和 oversized payload 都會
+實際送出。只有空 payload 無法傳輸，會以 `blocked-by-safety-policy` 留在 report。這表示測試
+目標必須是可拋棄的虛擬環境，絕不能指向生產設備。
 
 ## 分類不是漏洞結論
 
@@ -61,6 +65,6 @@ FC43 也只允許 MEI 0x0E Read Device Identification。`length` strategy 的畸
 5. 比對 response、時間、服務狀態和 process restart 等獨立證據。
 
 `minimize` 目前只做結構裁切，不是完整 delta-debugging，也不會自動 replay 驗證。操作員
-必須先檢查輸出，再決定是否重播。`replay` 也會套用相同唯讀 allowlist、單一 ADU framing
-檢查與 50 requests/second 上限，不會把 report 中標為 blocked 的寫入/未知功能碼案例送出。
-這些 fuzz/replay 安全邊界不套用到 expert-level raw `send`，後者會原樣傳送提供的 ADU。
+必須先檢查輸出，再決定是否重播。`replay` 與 fuzz 使用相同的傳輸邊界：寫入、未知或畸形
+payload 都會重送到 report 記錄的虛擬環境目標，只保留 50 requests/second 上限。
+expert-level raw `send` 也會原樣傳送提供的 ADU。
