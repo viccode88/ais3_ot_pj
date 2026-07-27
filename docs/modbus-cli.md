@@ -602,7 +602,7 @@ modbus-cli fuzz \
 | `--port PORT` | 否 | 直接 target 為 `502` | 直接指定目的埠；或在報告有多個合格候選時消歧義 |
 | `--timeout SEC` | 否 | `1.5` | 每個 execute case 的 TCP connect/read timeout |
 | `--unit-id ID` | 否 | `1` | 產生 baseline request 時使用的 Unit ID |
-| `--strategy STRATEGY` | 否，可重複 | 實際使用 `boundary` | 九種策略之一；多次指定時依順序循環 |
+| `--strategy STRATEGY` | 否，可重複 | 實際使用 `boundary` | 十種策略之一；多次指定時依順序循環 |
 | `--requests N` | 否 | `100` | 案例數，限制 1–10000 |
 | `--rate RATE` | 否 | `10` | 每秒最多幾個 request，必須大於 0 且不超過 50 |
 | `--interval SEC` | 否 | 無 | 相鄰 request 的等待秒數，必須大於 0；不能與 `--rate` 同時指定 |
@@ -672,6 +672,7 @@ request。成功後會等待一個 fuzz interval 才送第一個 case，避免�
 | `unit-id` | Unit ID |
 | `semantic` | 位址/數量的語意不一致 |
 | `random` | 1–4 個 byte 的隨機替換 |
+| `huge-payload` | 舊腳本的 oversized FC16 malformed payload（quantity 200–2000，byte_count wrap） |
 
 未指定策略時使用 `boundary`。
 
@@ -723,16 +724,13 @@ scan report、Unit ID、策略順序、案例數與 seed 必須保持一致。
 `exception-bit-set`，framing 有警告時會附上 `malformed framing`。不能假定所有案例都是
 baseline FC03。
 
-突變後的實際 payload 在建立 socket 前還會再套用唯讀功能碼 allowlist，並要求恰好一個
-完整 MBAP ADU（protocol ID 0、宣告長度與實際長度一致、不得尾隨或串接第二個 ADU）。
-FC43 只允許完整的 MEI 0x0E Read Device Identification；可讀寫的其他 MEI subtype 會封鎖。
-FC05、FC06、FC15、FC16、未知功能碼或無法安全判定 framing 的 request 會保留在 report，但標為
-`status=blocked`、`classification=blocked-by-safety-policy`，不會傳送。stderr 會顯示
-`BLOCKED`，stdout 摘要中的 `executed_cases` 與 `blocked_cases` 可用來核對實際結果。
-
-因此 `length` strategy 適合離線 corpus/decoder 測試；其刻意不一致的 MBAP length 在
-`--execute` 時會被 transport boundary 封鎖。`bitflip`、`byteflip` 或 `random` 若改到
-MBAP framing，也會同樣保留案例但不送出。
+這個工具服務於完全虛擬環境的可靠性測試，傳輸邊界刻意不套用唯讀功能碼 allowlist，也
+不要求完整 MBAP framing：FC05、FC06、FC15、FC16、未知功能碼、串接 ADU、非 MEI 0x0E 的
+FC43、`length` strategy 的不一致 MBAP length，以及 `huge-payload` 的 oversized ADU 都會
+實際送出。只有空 payload 無法傳輸，會標為 `status=blocked`、
+`classification=blocked-by-safety-policy`；stdout 摘要中的 `executed_cases` 與
+`blocked_cases` 可用來核對實際結果。過嚴的安全邊界會讓測試低弱且無效，因此目標必須是
+可捨棄的虛擬環境，絕不能指向生產設備。
 
 如果 transport 沒有回傳任何 bytes，CLI 不會虛構 Modbus response 類型，而會顯示
 `response-type=no-packet`，並保留真正的 transport 狀態與分類：
@@ -800,7 +798,7 @@ stdout 摘要維持以下欄位：
 | `possible-service-degradation` | 本次案例 timeout，需要 health check 和重播確認 |
 | `anomalous-transport` | connection error、disconnect 等傳輸異常 |
 | `possible-parser-inconsistency` | 收到的 response 有結構警告 |
-| `blocked-by-safety-policy` | 突變後不是明確唯讀 request，未建立 socket |
+| `blocked-by-safety-policy` | payload 為空，未建立 socket |
 | `inconclusive` | 尚未執行或證據不足 |
 
 ### 12.5 輸出與副作用
@@ -814,9 +812,9 @@ stdout 摘要維持以下欄位：
 
 ## 13. 重播：`replay`
 
-**用途與副作用：**從 fuzz case JSON 讀取已保存的 target 與 `request_hex`；通過相同的 fuzz
-唯讀功能碼檢查後立即重送。輸入若是 array，只使用第一筆 case。寫入、未知或無功能碼案例
-會在建立 socket 前被拒絕。
+**用途與副作用：**從 fuzz case JSON 讀取已保存的 target 與 `request_hex` 並立即重送。
+輸入若是 array，只使用第一筆 case。與 fuzz 相同，寫入、未知功能碼、串接 ADU 或畸形
+payload 都會重送到 report 記錄的虛擬環境目標；只有空 payload 會在建立 socket 前被拒絕。
 
 語法：
 
@@ -851,11 +849,11 @@ modbus-cli replay artifacts/fuzz-report.json \
 
 重要行為：
 
-- `replay` 會在唯讀安全檢查通過後立即連到 JSON 內 `target.host` 和 `target.port`，沒有第二個
+- `replay` 會立即連到 JSON 內 `target.host` 和 `target.port` 重送 payload，沒有第二個
   確認參數。
 - 輸入可以是單一 case object 或 case array；array 只會重播第一個 case。
 - `replay` 與 fuzz 共用 1–10000 次、最高 50 次/秒的硬限制；`--interval 0` 會被拒絕。
-- 安全檢查要求單一完整 MBAP ADU，會封鎖尾隨/串接 ADU 與非 MEI 0x0E 的 FC43。
+- 傳輸邊界不檢查功能碼或 framing，只拒絕空 payload；report 必須來自可捨棄的虛擬環境。
 - `stable: true` 只表示每次 transport `status` 相同，不表示問題已證實或 response 完全相同。
 
 stdout 是包含 `case_id`、`results` 和 `stable` 的 JSON。命令最多建立 `--times` 條新 TCP

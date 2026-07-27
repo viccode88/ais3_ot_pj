@@ -122,7 +122,7 @@ modbus-cli probe --target 192.168.56.10 --port 502 --unit-id 1
 | `scan` | **是** | 對預設 PLC/ICS TCP 埠與 `--ports` 指定埠做連線/安全協定探測 |
 | `fuzz` | 否 | 預設只產生 corpus/report |
 | `fuzz --execute` | **是** | 逐一送出產生的 fuzz cases |
-| `replay` | **是** | 唯讀安全檢查通過後立即重送，不需要額外的 `--execute` |
+| `replay` | **是** | 立即重送保存的 case（含寫入與畸形 payload），不需要額外的 `--execute` |
 | `write ... --confirm` | 目前不會 | 預設 policy 仍會拒絕所有實際寫入 |
 
 預設只允許 loopback 與 RFC1918 私有位址：
@@ -133,8 +133,9 @@ modbus-cli probe --target 192.168.56.10 --port 502 --unit-id 1
 - `192.168.0.0/16`
 
 hostname 會先解析成 IPv4 再套用限制。這不是授權機制；使用者仍需自行確認測試範圍。
-`fuzz --execute` 與 `replay` 的唯讀安全檢查不會套用到 expert-level `send`；`send` 會原樣
-傳送使用者提供的 ADU，包含寫入功能碼，因此使用前必須先用 `decode` 完整審查。
+`fuzz --execute` 與 `replay` 服務於完全虛擬環境的可靠性測試，傳輸邊界不再限制功能碼或
+framing：寫入功能碼、串接 ADU 與 oversized payload 都會實際送出。expert-level `send` 同樣
+會原樣傳送使用者提供的 ADU，因此使用前必須先用 `decode` 完整審查。
 
 ## 常見操作
 
@@ -262,8 +263,23 @@ exception、malformed 或 no-packet 類型，例如：
 
 同一個 seed、策略順序與案例數會產生相同 request。`--rate 10` 表示每秒最多 10 個 request；
 `--interval 0.5` 表示每次傳送間隔 0.5 秒，兩者不能同時使用。
-主動執行只允許單一且長度一致的 MBAP ADU；寫入功能碼、串接 ADU、非 MEI 0x0E 的 FC43，
-以及 `length` strategy 產生的畸形 framing 都會保留為 blocked case，但不會送出。
+傳輸邊界不再做 read-only 或 framing 檢查，只有空 payload 會被擋下；`length` strategy 的
+畸形 framing、`random`/`bitflip` 產生的寫入功能碼，以及 `huge-payload` 的 oversized FC16
+都會實際送往虛擬實驗室目標。
+
+`huge-payload` 策略產生舊腳本的 FC16 Write Multiple Registers malformed payload：quantity
+200..2000、實際 body 為 `quantity * 2` bytes、1-byte `byte_count` 依舊 wrap，MBAP length 宣告
+完整 oversized PDU：
+
+```bash
+modbus-cli fuzz \
+  --target 192.168.56.10 \
+  --strategy huge-payload \
+  --requests 10 \
+  --interval 1 \
+  --output artifacts/huge-payload-report.json \
+  --execute
+```
 
 ### 重播與最小化案例
 
@@ -366,21 +382,12 @@ tool vuln run CVE-2025-53476 \
 tool vuln run CVE-2025-53476 \
   --trigger-strategy advisory \
   --max-connections 800 --verbose
-
-# OpenPLC v3 專用：重現舊腳本的 FC16 huge payload 路徑
-tool vuln run CVE-2025-53476 \
-  --trigger-strategy huge-payload \
-  --max-connections 32 --verbose --json
 ```
 
 `--max-connections` 是 bounded lifecycle 嘗試上限，仍會被案例絕對上限夾住；同時開啟或保留的 client socket 另由 `active_connection_limit = RLIMIT_NOFILE - baseline descriptors - safety reserve` 控制，並寫入 dry-run 與報告。這個分離是為了符合 CVE-2025-53476 advisory：多輪 no-payload connect/wait/client-close 可能重用 client fd，但 server 端 `CLOSE_WAIT`/fd 會逐步累積。`--target-nofile` 只會改本案例建立的 OpenPLC container `nofile`，允許範圍是 32..128；`--safety-reserve` 只會改本案例的 descriptor reserve，允許範圍是 1..32。`--trigger-strategy advisory` 只使用 no-payload connect、等待、client close，最後保留一條 no-payload socket；`mixed` 可用來少量混入 incomplete MBAP header 作比較，但不是預設。`--keep-environment` 只能保留本案例專用 Compose project；正常完成會刪除容器、network 與暫存狀態。
 
-`--trigger-strategy huge-payload` 是 OpenPLC v3 隔離案例專用，移植舊腳本的
-FC16 Write Multiple Registers malformed payload：quantity 200..2000、實際 body 為
-`quantity * 2` bytes、1-byte `byte_count` 依舊 wrap，MBAP length 宣告完整 oversized
-PDU。這條路徑不走一般 `fuzz --execute`，也不接受任意 target；verdict 會依 baseline
-穩定性、huge payload 後合法 Modbus probe 劣化、target process 狀態、FD/socket 指標和
-fresh recovery 判定。
+舊腳本的 FC16 huge payload 是 fuzz 功能而不是 vulnerability case 的 trigger；它已搬回
+`fuzz --strategy huge-payload`，可對完全虛擬的目標直接執行。
 
 每次 run 產生 `reports/<timestamp>_CVE-2025-53476/`。先讀 `summary.json` 的 verdict；`network-actions.jsonl` 保存完整 ADU/PDU、MBAP 欄位、回應和 socket error；`observations.jsonl` 是 timestamped FD/thread/socket/CPU/memory 序列（無法取得明確標為 `unavailable`）；`openplc.log`、`runner.log`、`timeline.jsonl` 與 `report.md` 提供人類與程式可讀的完整證據。
 

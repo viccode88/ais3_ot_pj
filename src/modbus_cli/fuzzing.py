@@ -10,7 +10,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 from .protocol import decode_adu, encode_adu
 from .transport import TCPTransport
@@ -25,9 +25,16 @@ STRATEGIES = (
     "unit-id",
     "semantic",
     "random",
+    "huge-payload",
 )
 
-READ_ONLY_FUNCTION_CODES = frozenset({1, 2, 3, 4, 7, 11, 12, 17, 20, 24, 43})
+# Legacy FC16 Write Multiple Registers malformed payload: quantity stays in the
+# 200..2000 range, the 1-byte byte_count wraps, and the MBAP length declares the
+# full oversized body.  This is a virtual-lab reliability probe, not a write
+# operation against production equipment.
+HUGE_PAYLOAD_MIN_REGISTERS = 200
+HUGE_PAYLOAD_MAX_REGISTERS = 2000
+MAX_HUGE_PAYLOAD_REGISTERS = (0xFFFF - 7) // 2
 
 
 @dataclass
@@ -52,39 +59,53 @@ FuzzProgressCallback = Callable[[FuzzProgressEvent, FuzzCase], None]
 
 
 def fuzz_payload_safety_reason(payload: bytes) -> str | None:
-    """Return why a mutated/replayed payload may not cross the fuzz transport boundary."""
-    if len(payload) < 8:
-        return "request does not contain one complete MBAP ADU and function byte"
+    """Return why a payload may not cross the fuzz transport boundary.
 
-    _transaction_id, protocol_id, declared_length = struct.unpack(">HHH", payload[:6])
-    if protocol_id != 0:
-        return "MBAP protocol ID must be zero"
-    if not 2 <= declared_length <= 254:
-        return "MBAP length must describe a 2..254 byte unit-and-PDU payload"
-    expected_size = 6 + declared_length
-    if len(payload) != expected_size:
-        return (
-            f"MBAP length declares {expected_size} total bytes but request contains "
-            f"{len(payload)}; trailing, concatenated, and truncated ADUs are blocked"
-        )
-
-    function_code = payload[7]
-    if function_code not in READ_ONLY_FUNCTION_CODES:
-        return (
-            f"function code 0x{function_code:02X} is not an explicitly allowed read-only operation"
-        )
-
-    # FC43 is a multiplexed transport: MEI 0x0D can write CANopen objects.
-    # Only the exact FC43/MEI 0x0E Read Device Identification request shape is
-    # allowed through the active transport boundary.
-    if function_code == 43:
-        pdu = payload[7:]
-        if len(pdu) != 4 or pdu[1] != 0x0E or pdu[2] not in {1, 2, 3, 4}:
-            return (
-                "function code 0x2B is allowed only as a complete MEI 0x0E "
-                "Read Device Identification request"
-            )
+    This fuzzer exists to test the reliability of fully virtual lab targets, so
+    the transport boundary deliberately does not enforce read-only function
+    codes or well-formed MBAP framing: malformed, oversized, and write-function
+    payloads are exactly what reliability testing needs to send.  Only an empty
+    payload cannot be transmitted.
+    """
+    if not payload:
+        return "request payload is empty"
     return None
+
+
+def build_huge_payload(
+    transaction_id: int,
+    unit_id: int,
+    register_count: int,
+) -> tuple[bytes, dict[str, Any]]:
+    """Build the legacy malformed FC16 Write Multiple Registers payload.
+
+    The 1-byte ``byte_count`` wraps while the MBAP length declares the full
+    oversized body, mirroring the historical OpenPLC v3 fuzz input.
+    """
+    register_count = max(1, min(register_count, MAX_HUGE_PAYLOAD_REGISTERS))
+    data_length = register_count * 2
+    byte_count = data_length & 0xFF
+    data = bytes((transaction_id + register_count + offset) & 0xFF for offset in range(data_length))
+    pdu = struct.pack(">BHHB", 16, 0, register_count, byte_count) + data
+    payload = struct.pack(">HHHB", transaction_id & 0xFFFF, 0, len(pdu) + 1, unit_id & 0xFF) + pdu
+    decoded_request = decode_adu(payload)
+    modbus = {
+        "transaction_id": transaction_id & 0xFFFF,
+        "protocol_id": 0,
+        "length": len(pdu) + 1,
+        "unit_id": unit_id & 0xFF,
+        "function_code": 16,
+        "pdu_hex": payload[7:].hex().upper(),
+        "adu_hex": payload.hex().upper(),
+        "write_start_address": 0,
+        "write_quantity": register_count,
+        "byte_count": byte_count,
+        "actual_data_bytes": data_length,
+        "byte_count_mismatch": byte_count != data_length,
+        "legacy_huge_payload_shape": True,
+        "decoded_request": decoded_request.as_dict(),
+    }
+    return payload, modbus
 
 
 class CaseGenerator:
@@ -129,6 +150,15 @@ class CaseGenerator:
                 (b"\xff\xff\x00\x02", b"\xff\xff\xff\xff", b"\x00\x00\x00\x00")
             )
             mutations.append("invalid-address-quantity")
+        elif strategy == "huge-payload":
+            register_count = rng.randint(HUGE_PAYLOAD_MIN_REGISTERS, HUGE_PAYLOAD_MAX_REGISTERS)
+            huge_payload, _modbus = build_huge_payload(
+                transaction_id=index & 0xFFFF,
+                unit_id=unit_id,
+                register_count=register_count,
+            )
+            packet = bytearray(huge_payload)
+            mutations.append(f"fc16-huge-payload:quantity={register_count}")
         else:
             for _ in range(rng.randint(1, 4)):
                 position = rng.randrange(len(packet))

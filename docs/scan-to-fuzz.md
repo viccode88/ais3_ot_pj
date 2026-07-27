@@ -147,15 +147,16 @@ fuzz cases。正常 FC03 response 或合法的 FC03 exception response 都可通
 | `scan` | 是 | TCP connect，並依角色埠執行安全協定 probe |
 | `fuzz`，不加 `--execute` | 否 | 只產生 JSON corpus；仍會解析並驗證 target |
 | `fuzz --scan-report ... --execute` | 是 | 先送 1 個 FC03 preflight，再逐案傳送 |
-| `replay` | 是 | 立即重送 report 第一筆安全檢查通過的案例 |
+| `replay` | 是 | 立即重送 report 第一筆案例（含寫入與畸形 payload） |
 | `send` | 是 | Expert raw transport；可送任意 ADU，包含寫入功能碼 |
 | `build`、`decode`、`minimize` | 否 | 純離線操作 |
 
 預設只允許 loopback 與 RFC1918 私有 IPv4。這個 allowlist 不是授權機制；即使 IP 被接受，
 操作員仍須確認測試授權、PLC process safety、復原方法與觀測方式。
 
-本指南後述的唯讀 allowlist、single-ADU 與 FC43 MEI 安全閘只適用 `fuzz`/`replay`，不適用
-raw `send`。使用 `send` 前必須先以 `decode` 人工確認功能碼與完整 payload。
+`fuzz`/`replay` 服務於完全虛擬環境的可靠性測試，傳輸邊界不做 read-only 或 framing 檢查；
+raw `send` 也會原樣傳送任意 ADU。使用 `send` 前必須先以 `decode` 人工確認功能碼與完整
+payload。
 
 ## 3. 掃描語法與參數
 
@@ -484,17 +485,15 @@ modbus-cli fuzz \
 - `--requests` 限制的是 fuzz cases；report-driven execute 會額外送 1 個 FC03 preflight。
 - Rate 必須大於 0 且最多 50 fuzz requests/second；preflight 成功後會等待一個相同 interval
   才送第一個 case，executor 目前仍循序執行。
-- 每個 mutation 在 socket 建立前重新檢查。
-- 只允許明確唯讀功能碼：FC01、02、03、04、07、11、12、17、20、24、43。
-- FC43 只允許完整的 MEI 0x0E Read Device Identification。
-- 必須恰好是一個完整 MBAP ADU，protocol ID 必須為 0，宣告長度必須與實際長度一致。
-- 寫入功能碼、未知功能碼、尾隨/串接 ADU 或畸形 framing 會保存為
-  `blocked-by-safety-policy`，不會傳送。
-- `length` strategy 適合離線 corpus/decoder 測試；其畸形 MBAP length 在 `--execute` 時
-  預期會被封鎖。
+- 傳輸邊界刻意不做 read-only 或 framing 檢查，因為這個 fuzzer 的目的是測試虛擬環境的
+  可靠性；過嚴的邊界會讓測試低弱且無效，讓問題流入生產環境。
+- 寫入功能碼、未知功能碼、尾隨/串接 ADU、非 MEI 0x0E 的 FC43、畸形 framing 與 oversized
+  payload 都會實際送出。
+- 只有空 payload 無法傳輸，會保存為 `blocked-by-safety-policy`。
+- `huge-payload` strategy 會送出舊腳本的 oversized FC16 malformed payload（quantity
+  200–2000、byte_count wrap）；它是 fuzz 功能，不屬於 vulnerability case。
 
-若要主動執行，建議先使用 `boundary`、`semantic`、`transaction` 或 `unit-id` 等仍能保持
-單一完整 ADU 的策略，並從少量案例與低速率開始。
+主動執行的目標必須是可捨棄的虛擬環境，並從少量案例與低速率開始。
 
 ## 9. 常見問題
 

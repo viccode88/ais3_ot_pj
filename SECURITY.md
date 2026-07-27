@@ -9,10 +9,11 @@ for physical/process safety.
 
 Port numbers are service hints, not proof. The scan-to-fuzz handoff only accepts an open Modbus/TCP
 endpoint confirmed by an application-layer response, rechecks the report's resolved address against the
-private-target policy, and still requires `--execute` before sending fuzz cases. Mutated payloads are
-checked again at the transport boundary; non-read-only function codes are recorded as blocked and are
-not transmitted. The boundary also requires exactly one complete MBAP ADU and permits FC43 only for
-MEI 0x0E Read Device Identification, preventing concatenated-ADU and multiplexed-function write
-bypasses. Executing from a scan report first performs one correlated read-only FC03 preflight using
-the selected unit ID and waits one configured fuzz interval before the first case. These fuzz/replay
-safety gates do not apply to the raw `send` command.
+private-target policy, and still requires `--execute` before sending fuzz cases. The fuzzer serves
+reliability testing of fully virtual lab targets, so the transport boundary deliberately does not
+restrict function codes or MBAP framing: write functions, unknown operations, concatenated ADUs and
+oversized payloads are transmitted as generated. Only an empty payload is blocked. This means fuzz
+and replay targets must be disposable virtual environments, never production equipment. Executing
+from a scan report first performs one correlated read-only FC03 preflight using the selected unit ID
+and waits one configured fuzz interval before the first case. The raw `send` command likewise
+transmits any supplied ADU.

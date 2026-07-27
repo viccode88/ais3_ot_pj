@@ -1,4 +1,5 @@
 import json
+import struct
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ from modbus_cli.fuzzing import (
     STRATEGIES,
     CaseGenerator,
     FuzzCase,
+    build_huge_payload,
     execute_cases,
     fuzz_payload_safety_reason,
     save_cases,
@@ -45,7 +47,7 @@ def test_safety_limits_and_public_target() -> None:
         policy.validate_fuzz(1, 51, 1)
 
 
-def test_seed_17_33rd_random_case_blocks_fc06_before_transport(
+def test_seed_17_33rd_random_case_sends_fc06_to_virtual_lab(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     generator = CaseGenerator(17)
@@ -65,19 +67,16 @@ def test_seed_17_33rd_random_case_blocks_fc06_before_transport(
     monkeypatch.setattr("modbus_cli.fuzzing.TCPTransport", RecordingTransport)
     execute_cases([case], timeout=1.5, interval=0)
 
-    assert transport_calls == []
-    assert case.sent_at is None
-    assert case.status == "blocked"
-    assert case.classification == "blocked-by-safety-policy"
-    assert case.safety_reason is not None
-    assert "0x06" in case.safety_reason
+    assert transport_calls[-1] == (bytes.fromhex(case.request_hex),)
+    assert case.sent_at is not None
+    assert case.status == "sent"
+    assert case.safety_reason is None
 
-    output = tmp_path / "blocked-report.json"
+    output = tmp_path / "sent-report.json"
     save_cases(output, [case])
     report_case = json.loads(output.read_text())[0]
-    assert report_case["status"] == "blocked"
-    assert report_case["classification"] == "blocked-by-safety-policy"
-    assert "0x06" in report_case["safety_reason"]
+    assert report_case["status"] == "sent"
+    assert report_case["safety_reason"] is None
 
 
 def test_read_only_fc03_is_still_sent(
@@ -111,7 +110,7 @@ def test_read_only_fc03_is_still_sent(
     assert case.safety_reason is None
 
 
-def test_concatenated_read_and_write_adus_are_blocked_before_transport(
+def test_concatenated_read_and_write_adus_are_sent_to_virtual_lab(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     payload = encode_adu(3, 0, 1) + encode_adu(6, 0, values=[1])
@@ -123,28 +122,31 @@ def test_concatenated_read_and_write_adus_are_blocked_before_transport(
         payload.hex(),
         [],
     )
-    transport_calls: list[object] = []
-    monkeypatch.setattr(
-        "modbus_cli.fuzzing.TCPTransport",
-        lambda *_args, **_kwargs: transport_calls.append(object()),
-    )
+    sent_payloads: list[bytes] = []
+
+    class RecordingTransport:
+        def __init__(self, *args: object) -> None:
+            pass
+
+        def exchange(self, payload: bytes) -> TransportResult:
+            sent_payloads.append(payload)
+            return TransportResult(None, 0.0, "sent")
+
+    monkeypatch.setattr("modbus_cli.fuzzing.TCPTransport", RecordingTransport)
 
     execute_cases([case], timeout=1.5, interval=0)
 
-    assert transport_calls == []
-    assert case.status == "blocked"
-    assert case.safety_reason is not None
-    assert "concatenated" in case.safety_reason
+    assert sent_payloads == [payload]
+    assert case.status == "sent"
+    assert case.safety_reason is None
 
 
-def test_fc43_allows_only_read_device_identification_mei() -> None:
+def test_fc43_allows_any_mei_for_virtual_lab_testing() -> None:
     read_device_id = bytes.fromhex("000100000005012B0E0100")
     canopen_write_capable_mei = bytes.fromhex("000100000004012B0D00")
 
     assert fuzz_payload_safety_reason(read_device_id) is None
-    reason = fuzz_payload_safety_reason(canopen_write_capable_mei)
-    assert reason is not None
-    assert "MEI 0x0E" in reason
+    assert fuzz_payload_safety_reason(canopen_write_capable_mei) is None
 
 
 @pytest.mark.parametrize(
@@ -155,5 +157,54 @@ def test_fc43_allows_only_read_device_identification_mei() -> None:
         bytes.fromhex("00010000000601030000"),
     ),
 )
-def test_invalid_mbap_framing_is_blocked(payload: bytes) -> None:
-    assert fuzz_payload_safety_reason(payload) is not None
+def test_invalid_mbap_framing_is_sent_to_virtual_lab(payload: bytes) -> None:
+    assert fuzz_payload_safety_reason(payload) is None
+
+
+def test_empty_payload_is_the_only_transport_boundary_block() -> None:
+    assert fuzz_payload_safety_reason(b"") is not None
+
+
+def test_huge_payload_strategy_matches_legacy_fc16_shape() -> None:
+    case = CaseGenerator(7).generate(1, "huge-payload", 1, "127.0.0.1", 502)
+    payload = bytes.fromhex(case.request_hex)
+    register_count = struct.unpack(">H", payload[10:12])[0]
+
+    assert "huge-payload" in STRATEGIES
+    assert payload[7] == 16
+    assert 200 <= register_count <= 2000
+    assert payload[12] == (register_count * 2) & 0xFF
+    assert len(payload) == 7 + 1 + 2 + 2 + 1 + (register_count * 2)
+    assert struct.unpack(">H", payload[4:6])[0] == len(payload) - 6
+    assert case.mutations == [f"fc16-huge-payload:quantity={register_count}"]
+
+
+def test_build_huge_payload_wraps_byte_count() -> None:
+    payload, modbus = build_huge_payload(transaction_id=0xD000, unit_id=1, register_count=2000)
+
+    assert payload[7] == 16
+    assert modbus["byte_count_mismatch"] is True
+    assert modbus["legacy_huge_payload_shape"] is True
+    assert "byte count mismatch" in modbus["decoded_request"]["warnings"]
+
+
+def test_huge_payload_is_sent_through_virtual_lab_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = CaseGenerator(11).generate(1, "huge-payload", 1, "127.0.0.1", 502)
+    sent_payloads: list[bytes] = []
+
+    class RecordingTransport:
+        def __init__(self, *args: object) -> None:
+            pass
+
+        def exchange(self, payload: bytes) -> TransportResult:
+            sent_payloads.append(payload)
+            return TransportResult(None, 0.25, "sent")
+
+    monkeypatch.setattr("modbus_cli.fuzzing.TCPTransport", RecordingTransport)
+    execute_cases([case], timeout=1.5, interval=0)
+
+    assert sent_payloads == [bytes.fromhex(case.request_hex)]
+    assert case.status == "sent"
+    assert case.safety_reason is None
