@@ -73,6 +73,8 @@ plcfp scan 10.20.30.40 --profile lab --dnp3-address 1
 ## 探測層與安全界線
 
 - L0：讀取 classic Ethernet PCAP，辨識 v3 HTTP、v4 API/Socket.IO 路徑及通訊對象；不送封包。
+  記憶體使用量與 capture 大小無關：raw 證據每類最多保留 1 MiB，每埠最多記錄 1024 條
+  flow（超過時在 communication map 以 `_truncated` 標記）。
 - L1：對 catalog/角色埠逐一 TCP connect。若 v4 HTTPS 角色埠開放，另做 TLS handshake，
   擷取 DER 憑證、DN、效期、SAN、雜湊、協定與 cipher。
 - L2：對開放角色埠執行 v3 HTTP GET、v4 API GET、空 body `POST /api/login`、Engine.IO

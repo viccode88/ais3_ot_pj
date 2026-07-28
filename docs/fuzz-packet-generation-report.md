@@ -295,7 +295,7 @@ save_json(cases)
 
 ---
 
-## 6. 九種 mutation strategy 詳解
+## 6. 二十二種 mutation strategy 詳解
 
 ### 6.1 總表
 
@@ -304,12 +304,25 @@ save_json(cases)
 | `boundary` | bytes 10–11 | `0, 1, 124, 125, 126, 127, 128, 255, 65535` | FC03 quantity 邊界與越界處理 | MBAP 與 FC 仍合法，會通過安全閘 |
 | `bitflip` | 任一 byte 的任一 bit | 一次 XOR | 廣泛單 bit fault | 視實際落點決定 |
 | `byteflip` | 任一 byte | XOR `0xFF` | 整個 byte 反相 | 視實際落點決定 |
-| `length` | bytes 4–5 | `0, 1, 5, 7, 65535` | MBAP framing 與長度錯誤 | 目前所有候選都會被主動安全閘封鎖 |
+| `length` | bytes 4–5 與 ADU 大小 | `2, 3, 5, 7, 8, 12, 253, 254`；截斷或延伸 PDU 並保持 MBAP length 一致 | 截斷/延伸 PDU 的長度處理 | framing 合法，會通過 |
 | `function-code` | byte 7 | `0, 7, 43, 127, 128, 255` | 未知、保留、例外位元與非典型 FC | 實際上通常只有 FC07 可能通過 |
 | `transaction` | bytes 0–1 | `0, 1, 65535` | Transaction ID 邊界與配對行為 | 會通過 |
 | `unit-id` | byte 6 | `0, 1, 247, 248, 255` | Unit ID 邊界、保留與 gateway 行為 | 會通過 |
 | `semantic` | bytes 8–11 | 三組固定 address/quantity | 邏輯邊界與不一致參數 | FC03 與 framing 合法，會通過 |
 | `random` | 任意 1–4 個 byte | 每次以 0–255 替換 | 混合、非定向 mutation | 視最終 payload 決定 |
+| `huge-payload` | 整個 ADU | FC16 quantity 200–2000，byte_count wrap | oversized write payload 的解析與資源處理 | 會通過（虛擬實驗室邊界） |
+| `protocol-id` | bytes 2–3 | `1, 255, 256, 65535`、隨機非零值 | Protocol ID 驗證與閘道轉送行為 | 會通過 |
+| `address-wrap` | bytes 8–11 | `0xFFFE+4`、`0xFFFF+1` 等溢位組合 | 暫存器映射邊界的整數溢位 | framing 合法，會通過 |
+| `truncated-mbap` | 整個 ADU | 只保留 1–6 bytes | 不完整 header 的 partial-read 狀態機 | 會通過（非空） |
+| `concatenated-adu` | ADU 尾部 | 串接合法/垃圾/截斷第二幀 | pipelining 與 framing resync | 會通過 |
+| `pdu-mismatch` | PDU + length 重算 | FC15/FC16 byte_count 不符、FC05 非法 toggle、FC03 trailing bytes | 解析器欄位交叉驗證 | framing 合法，會通過 |
+| `exception-shape` | PDU 重建 | FC `0x81/0x83/0x90` + exception code | request/response 混淆 | framing 合法，會通過 |
+| `mei-subtype` | PDU 重建 | FC43 MEI `0x0D/0x0E` 變體與截斷 | FC43 多工層、含寫入能力的 MEI 0x0D | framing 合法，會通過 |
+| `rtu-over-tcp` | 整個 ADU | RTU frame（含正確 CRC16）經 TCP | RTU/TCP 閘道混淆 | 會通過 |
+| `fill` | bytes 6–11 | 全部 `0x00` 或 `0xFF` | 全零/全一輸入的 null-deref 類 bug | framing 合法，會通過 |
+| `fragmented-send` | 傳輸方式 | ADU 拆 2–3 段、段間延遲 0.05–1.0s | partial frame reassembly 與執行緒持有 | 會通過（單一連線多步） |
+| `repeat-storm` | 傳輸方式 | 單一連線連發 3–20 次 | server 端狀態/資源累積 | 會通過（單一連線多步） |
+| `session-sequence` | 傳輸方式 | 合法→畸形→合法 序列 | 跨請求狀態污染 | 會通過（單一連線多步） |
 
 ### 6.2 `boundary`
 
@@ -373,33 +386,32 @@ packet[position] ^= 0xFF
 
 ### 6.5 `length`
 
-此策略覆寫 MBAP Length：
+此策略調整 ADU 的實際大小，並讓 MBAP Length 與調整後的 unit-and-PDU 大小一致：
 
 ```python
+value = rng.choice((2, 3, 5, 7, 8, 12, 253, 254))
+target_size = 6 + value
+if target_size < len(packet):
+    del packet[target_size:]
+elif target_size > len(packet):
+    packet.extend(rng.randrange(256) for _ in range(target_size - len(packet)))
 packet[4:6] = value.to_bytes(2, "big")
 ```
 
 候選值：
 
 ```text
-0, 1, 5, 7, 65535
+2, 3, 5, 7, 8, 12, 253, 254
 ```
 
-實際封包仍維持 12 bytes。最後安全閘要求：
+- 比基準 12 bytes 短的值（2、3、5）會截斷 PDU，測試目標如何處理缺欄位的短 PDU。
+- 比基準長的值（7、8、12、253、254）會以隨機 bytes 延伸 PDU，測試目標如何處理多餘
+  trailing data。
+- 所有案例的 `declared_length` 都在 2..254 且與實際大小一致，framing 合法，保證能
+  送出，真正測到目標的長度處理邏輯。
 
-```text
-2 <= declared_length <= 254
-len(payload) == 6 + declared_length
-```
-
-12-byte request 的正確 declared length 必須是 6，但策略候選中沒有 6。因此：
-
-- `0`、`1`、`65535` 因允許範圍不符而被封鎖。
-- `5` 宣告總長 11 bytes，但實際有 12 bytes。
-- `7` 宣告總長 13 bytes，但實際只有 12 bytes。
-
-所以 `length` 是有效的**離線畸形 corpus 策略**，但依目前程式碼，它產生的案例在
-`fuzz --execute` 中會全部被標成 `blocked-by-safety-policy`，不會開 socket。
+（舊版只覆寫 length 欄位為 `0, 1, 5, 7, 65535`，framing 必定不一致，在嚴格安全閘
+下會全部被封鎖，測不到任何東西，因此改為目前的調整大小設計。）
 
 ### 6.6 `function-code`
 
@@ -487,12 +499,161 @@ for _ in range(rng.randint(1, 4)):
 - mutation log 只記錄 `replace:<position>`，不記錄舊值與新值。
 - 最終可能成為唯讀、寫入、未知功能碼或畸形 framing；是否傳送由最後安全閘決定。
 
+### 6.11 `huge-payload`
+
+透過 `build_huge_payload()` 產生舊腳本的 FC16 Write Multiple Registers malformed payload：
+quantity 200–2000、實際 body 為 `quantity * 2` bytes、1-byte `byte_count` 依舊 wrap，
+MBAP length 宣告完整 oversized PDU。這是虛擬實驗室可靠性探針，不屬於任何
+vulnerability case。
+
+### 6.12 `protocol-id`
+
+覆寫 MBAP Protocol ID（bytes 2–3）：
+
+```python
+value = rng.choice((1, 0xFF, 0x100, 0xFFFF, rng.randrange(1, 0x10000)))
+packet[2:4] = value.to_bytes(2, "big")
+```
+
+Modbus/TCP 規定 Protocol ID 必為 0，但許多 OT 設備不驗證，或對非零值進入未測試的
+解析分支；閘道器甚至可能把它轉送給後端串口設備。
+
+### 6.13 `address-wrap`
+
+覆寫 FC03 的 start address 與 quantity，專門測「起點 + 數量」的算術溢位：
+
+```text
+(0xFFFE, 4), (0xFFFF, 1), (0xFFFF, 2), (0xFFF0, 0x20), (0, 0), (0x8000, 0x8000)
+```
+
+`boundary` 只改 quantity；`address-wrap` 補上暫存器映射邊界檢查中最經典的
+`start + quantity - 1` 溢位（繞回 0 附近）這個 crash 向量。framing 與功能碼維持合法。
+
+### 6.14 `truncated-mbap`
+
+只保留封包前 1–6 bytes：
+
+```python
+keep = rng.choice((1, 2, 3, 4, 5, 6))
+del packet[keep:]
+```
+
+送出不完整的 MBAP header，測試 server 的 partial-read 狀態機：緩衝區處理、連線占用、
+執行緒掛起（CVE-2025-53476 同族的連線持有問題）。非空 payload，安全閘不會封鎖。
+
+### 6.15 `concatenated-adu`
+
+在一個 TCP segment 內串接第二個 frame：
+
+- `valid`：另一個合法 FC03 ADU（不同 transaction ID）。
+- `garbage`：4–16 bytes 隨機資料。
+- `truncated`：基準 ADU 的前 1–7 bytes。
+
+測試 pipelining 與 framing resync——OT 閘道器與代理最常出錯的位置：第一個 ADU 正常
+回應後，第二個可能觸發解析錯亂。
+
+### 6.16 `pdu-mismatch`
+
+重建 PDU 並重算 MBAP length（framing 保持一致），專測解析器的欄位交叉驗證：
+
+| variant | 內容 |
+| --- | --- |
+| `fc16-short-byte-count` | quantity 4 但 byte_count 2（資料不足） |
+| `fc16-long-byte-count` | quantity 1 但 byte_count 8（資料過多） |
+| `fc15-bit-count-mismatch` | 9 coils 應需 2 bytes 但 byte_count 1 |
+| `fc05-invalid-toggle` | FC05 toggle 值非 `0x0000/0xFF00` |
+| `fc03-trailing-garbage` | FC03 PDU 尾端多 2 bytes 垃圾 |
+
+與 `huge-payload` 同族但為小封包版本，不會先被「封包太大」這層擋掉。
+
+### 6.17 `exception-shape`
+
+構造外型為 exception response 的 request：
+
+```python
+function = rng.choice((0x81, 0x83, 0x90))
+code = rng.choice((1, 2, 3, 4, 6, 11, rng.randrange(12, 256)))
+pdu = bytes((function, code))
+```
+
+測試 request/response 混淆：某些 stack 會把 exception bit 封包送進 response 處理路徑。
+framing 一致（length 3）。
+
+### 6.18 `mei-subtype`
+
+FC43 多工傳輸層的 MEI 變體：
+
+| variant | 內容 |
+| --- | --- |
+| `canopen-write` | MEI `0x0D`（CANopen，**具寫入能力**）+ 2 bytes |
+| `invalid-read-code` | MEI `0x0E` 搭配非法 read code（0、5、0xFF） |
+| `truncated` | 只有 FC + MEI 兩個 byte |
+| `invalid-mei` | 非法 MEI（0x00、0x7F、0xFF） |
+
+FC43/MEI 0x0D 可寫 CANopen 物件，是真實攻擊面；只在可捨棄虛擬環境使用。
+
+### 6.19 `rtu-over-tcp`
+
+把 Modbus RTU frame（unit + FC03 + address + quantity + **正確 CRC16**）直接經 TCP 送出，
+不含 MBAP header：
+
+```python
+rtu = struct.pack(">BBHH", unit_id, 3, 0, 1)
+packet = rtu + struct.pack("<H", _crc16_modbus(rtu))
+```
+
+測試 RTU/TCP 閘道混淆：OT 環境大量存在 RTU↔TCP 轉換器，錯誤的 frame 辨識可能讓指令
+被轉送到串口匯流排。
+
+### 6.20 `fill`
+
+Unit ID + PDU 六個 byte 全部填充 `0x00` 或 `0xFF`（MBAP length 維持 6，framing 合法）。
+全零/全一輸入經常觸發 null-deref、未初始化讀取類 bug；`random` 策略幾乎不可能碰巧
+生成這種輸入。
+
+### 6.21 `fragmented-send`
+
+不改封包內容，改**傳輸方式**：generator 在案例附上 `send_plan`，executor 把一個 ADU
+拆成 2–3 段 TCP write，段間延遲 0.05–1.0 秒：
+
+```python
+send_plan = {"mode": "fragmented", "segments": [...], "delay_seconds": delay}
+```
+
+測試 server 的 partial frame reassembly：為等剩餘 bytes 而占用執行緒/緩衝區的
+slow-loris 式情境，直接對應 CVE-2025-53476 類的連線持有問題。
+
+### 6.22 `repeat-storm`
+
+同一 payload 在**單一連線**連發 3–20 次，之後在剩餘 timeout 內盡量讀取回應：
+
+```python
+send_plan = {"mode": "repeat", "count": N}
+```
+
+測試 server 端狀態累積：記憶體/FD 是否隨重複請求成長。`execution.steps` 記錄實際
+送出次數與收到的回應數，回應數少於送出次數本身就是退化訊號。
+
+### 6.23 `session-sequence`
+
+單一連線依序送出「合法 FC03 → 畸形 → 合法 FC03」三個 payload，每步各讀一次回應：
+
+```python
+send_plan = {"mode": "session", "payloads": [valid, middle, valid]}
+```
+
+middle 變體：`garbage`（4–12 bytes 隨機）、`truncated`（1–7 bytes 部分 ADU）、
+`exception`（exception-shape ADU）。測試跨請求狀態污染：真實 OT client 都是長連線，
+前一個畸形封包是否讓後續合法請求失敗，是單封包架構測不到的面向。每步的
+request/response 記錄在 `execution.steps`。注意 TCP stream 語意下，若 middle 無回應，
+其後的 read 會消費下一個回應——判讀時以「最後一個合法 FC03 是否仍有回應」為準。
+
 ---
 
 ## 7. Deterministic 與可重現性的實際條件
 
 專案透過 `random.Random(seed)` 和固定策略排程達到 deterministic generation。測試套件會
-建立兩個相同 seed 的 generator，確認九種策略依序輸出的 `request_hex` 完全相同。
+建立兩個相同 seed 的 generator，確認二十二種策略依序輸出的 `request_hex` 完全相同。
 
 要重建同一組 request，至少必須保持：
 
@@ -898,26 +1059,30 @@ PYTHONPATH=src .venv/bin/python -m modbus_cli fuzz \
 | `case-000001` | boundary | `000100000006010300000000` | `quantity=0` |
 | `case-000002` | bitflip | `000200000206010300000001` | `bitflip:4:1` |
 | `case-000003` | byteflip | `000300000006FE0300000001` | `byteflip:6` |
-| `case-000004` | length | `000400000005010300000001` | `length=5` |
-| `case-000005` | function-code | `000500000006010000000001` | `function=0` |
-| `case-000006` | transaction | `000000000006010300000001` | `transaction=0` |
-| `case-000007` | unit-id | `000700000006F80300000001` | `unit=248` |
-| `case-000008` | semantic | `000800000006010300000000` | `invalid-address-quantity` |
-| `case-000009` | random | `0009450000AA010300000001` | `replace:5, replace:2, replace:5` |
+| `case-000004` | length | `0004000000080103000000013713` | `length=8` |
+| `case-000005` | function-code | `000500000006017F00000001` | `function=127` |
+| `case-000006` | transaction | `FFFF00000006010300000001` | `transaction=65535` |
+| `case-000007` | unit-id | `000700000006FF0300000001` | `unit=255` |
+| `case-000008` | semantic | `0008000000060103FFFFFFFF` | `invalid-address-quantity` |
+| `case-000009` | random | `5109AC0000060103AA000001` | `replace:0, replace:2, replace:8` |
 
-若把這九個案例加上 `--execute`：
+若把這九個案例加上 `--execute`，在目前的虛擬實驗室傳輸邊界下**全部會實際送出**
+（只有空 payload 會被封鎖）：
 
-- boundary 案例會通過。
-- bitflip 案例把 length 高位從 `0x00` 改成 `0x02`，declared length 成為 `0x0206`，會封鎖。
-- byteflip 案例只把 Unit ID `0x01` 變成 `0xFE`，會通過。
-- length 案例宣告 5、實際仍 12 bytes，會封鎖。
-- function-code 案例為 FC00，不在 allowlist，會封鎖。
-- transaction 案例會通過。
-- unit-id 案例會通過。
-- semantic 案例 quantity 0，但仍為完整唯讀 FC03，會通過。
-- random 案例破壞 Protocol ID/Length，會封鎖。
+- boundary 案例是合法 FC03、quantity 0，正常送出。
+- bitflip 案例把 length 高位從 `0x00` 改成 `0x02`，declared length 成為 `0x0206`，
+  framing 不一致但仍送出；目標通常丟棄或無回應。
+- byteflip 案例只把 Unit ID `0x01` 變成 `0xFE`，正常送出。
+- length 案例把 ADU 延伸為 14 bytes 且 MBAP length 宣告 8（與實際一致），是 framing
+  合法、PDU 帶 2 個多餘 trailing bytes 的 FC03，正常送出。
+- function-code 案例為 FC 0x7F（未知功能碼），仍送出。
+- transaction 案例 transaction ID 為 `0xFFFF`，正常送出。
+- unit-id 案例 Unit ID 為 `0xFF`，正常送出。
+- semantic 案例 address/quantity 為 `0xFFFFFFFF`，是 framing 合法的 FC03，正常送出。
+- random 案例破壞了 Transaction/Protocol ID 與 address 高位，framing 不一致但仍送出。
 
-這個例子也顯示：策略名稱本身不決定是否傳送，**最終突變後 bytes**才是安全判斷依據。
+這個例子也顯示：策略名稱本身不決定是否傳送；在目前的設計下，只有空 payload 無法
+傳輸，其餘突變後 bytes 一律送往可捨棄的虛擬目標。
 
 ---
 

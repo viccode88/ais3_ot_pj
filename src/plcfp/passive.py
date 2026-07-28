@@ -6,10 +6,22 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from plcfp.engine import classify
 from plcfp.model import Observation, ScanReport
 from plcfp.sigdb import load_signatures
+
+# Passive evidence must stay bounded: captures can hold hours of traffic, and
+# unbounded buffers previously let process memory grow with the capture size.
+MAX_RAW_EVIDENCE_BYTES = 1 << 20  # 1 MiB per retained evidence buffer
+MAX_FLOWS_PER_PORT = 1024
+
+
+def _extend_capped(buffer: bytearray, data: bytes) -> None:
+    remaining = MAX_RAW_EVIDENCE_BYTES - len(buffer)
+    if remaining > 0:
+        buffer.extend(data[:remaining])
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +89,7 @@ def analyze_pcap(
 ) -> ScanReport:
     started = datetime.now(UTC)
     flows: dict[str, set[str]] = {}
+    truncated_flow_ports: set[str] = set()
     observations: list[Observation] = []
     saw_v3_brand = False
     saw_v4_api = False
@@ -88,12 +101,16 @@ def analyze_pcap(
             continue
         for port in {packet.source_port, packet.destination_port}:
             if port in {502, 8080, 8443, 44818, 20000, 4840}:
-                flows.setdefault(str(port), set()).add(
-                    f"{packet.source}:{packet.source_port}->{packet.destination}:{packet.destination_port}"
-                )
+                flow_id = f"{packet.source}:{packet.source_port}->{packet.destination}:{packet.destination_port}"
+                peers = flows.setdefault(str(port), set())
+                if flow_id not in peers:
+                    if len(peers) < MAX_FLOWS_PER_PORT:
+                        peers.add(flow_id)
+                    else:
+                        truncated_flow_ports.add(str(port))
         lowered = packet.payload.lower()
         if 8080 in {packet.source_port, packet.destination_port}:
-            raw_v3.extend(packet.payload[:65536])
+            _extend_capped(raw_v3, packet.payload[:65536])
             if b"openplc" in lowered and (
                 b'type="password"' in lowered or b"type='password'" in lowered
             ):
@@ -102,14 +119,19 @@ def analyze_pcap(
             if packet.payload.startswith((b"\x16\x03", b"\x17\x03")):
                 saw_tls_8443 = True
             if b"/api/compilation-status" in lowered or b"/socket.io" in lowered:
-                raw_v4.extend(packet.payload[:65536])
+                _extend_capped(raw_v4, packet.payload[:65536])
                 saw_v4_api = True
 
+    communication_map: dict[str, Any] = {
+        port: sorted(peers) for port, peers in sorted(flows.items())
+    }
+    if truncated_flow_ports:
+        communication_map["_truncated"] = sorted(truncated_flow_ports)
     observations.append(
         Observation(
             probe_id="passive.communication_map",
             feature="passive.communication_map",
-            value={port: sorted(peers) for port, peers in sorted(flows.items())},
+            value=communication_map,
         )
     )
     if saw_v3_brand:

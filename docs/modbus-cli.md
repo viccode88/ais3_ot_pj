@@ -602,13 +602,14 @@ modbus-cli fuzz \
 | `--port PORT` | 否 | 直接 target 為 `502` | 直接指定目的埠；或在報告有多個合格候選時消歧義 |
 | `--timeout SEC` | 否 | `1.5` | 每個 execute case 的 TCP connect/read timeout |
 | `--unit-id ID` | 否 | `1` | 產生 baseline request 時使用的 Unit ID |
-| `--strategy STRATEGY` | 否，可重複 | 實際使用 `boundary` | 十種策略之一；多次指定時依順序循環 |
+| `--strategy STRATEGY` | 否，可重複 | 實際使用 `boundary` | 二十二種策略之一；多次指定時依順序循環 |
 | `--requests N` | 否 | `100` | 案例數，限制 1–10000 |
 | `--rate RATE` | 否 | `10` | 每秒最多幾個 request，必須大於 0 且不超過 50 |
 | `--interval SEC` | 否 | 無 | 相鄰 request 的等待秒數，必須大於 0；不能與 `--rate` 同時指定 |
 | `--concurrency N` | 否 | `1` | 安全限制為 1–4；目前 executor 仍循序執行 |
 | `--seed N` | 否 | `1` | deterministic PRNG seed |
 | `--output FILE` | 否 | `artifacts/fuzz-report.json` | 完整 case array 的 JSON report；父目錄會自動建立 |
+| `--health-check-interval N` | 否 | `0`（關閉） | 每傳送 N 個案例後送一次已知正常的 FC03 health probe，結果記錄在該案例的 `health_after`；被封鎖的案例不計入 N |
 | `--execute` | 否 | 關閉 | 明確允許傳送；省略時只產生 corpus |
 
 ### 12.1 詳細範例：先離線產生
@@ -673,6 +674,23 @@ request。成功後會等待一個 fuzz interval 才送第一個 case，避免�
 | `semantic` | 位址/數量的語意不一致 |
 | `random` | 1–4 個 byte 的隨機替換 |
 | `huge-payload` | 舊腳本的 oversized FC16 malformed payload（quantity 200–2000，byte_count wrap） |
+| `protocol-id` | MBAP Protocol ID 改為非零值 |
+| `address-wrap` | start+quantity 的算術溢位組合 |
+| `truncated-mbap` | 只送 1–6 bytes 的不完整 MBAP header |
+| `concatenated-adu` | 一個 TCP segment 串接第二個合法/垃圾/截斷 ADU |
+| `pdu-mismatch` | PDU 欄位交叉不一致（FC15/FC16 byte_count、FC05 toggle、FC03 trailing bytes），framing 保持一致 |
+| `exception-shape` | 外型為 exception response 的 request |
+| `mei-subtype` | FC43 MEI 變體（含具寫入能力的 0x0D CANopen） |
+| `rtu-over-tcp` | 含正確 CRC 的 Modbus RTU frame 經 TCP 送出 |
+| `fill` | Unit ID + PDU 全部填充 `0x00` 或 `0xFF` |
+| `fragmented-send` | 一個 ADU 拆成 2–3 段 TCP write、段間延遲（slow-loris 式 partial frame） |
+| `repeat-storm` | 同一 payload 在單一連線連發 3–20 次 |
+| `session-sequence` | 單一連線依序送 合法→畸形→合法 三個 payload，逐步記錄回應 |
+
+`fragmented-send`、`repeat-storm`、`session-sequence` 由 generator 在案例中附上
+`send_plan`，executor 會在**單一 TCP 連線**內執行多步傳送，逐步證據記錄在該案例的
+`execution` 欄位；案例層級的 `status`、`response_hex`、`classification` 與單封包案例一致。
+離線產生（無 `--execute`）時 `send_plan` 會存入 report 供人工審查。
 
 未指定策略時使用 `boundary`。
 
@@ -718,6 +736,9 @@ scan report、Unit ID、策略順序、案例數與 seed 必須保持一致。
 [case-000001] RX response-type=exception-response/read-holding-registers (FC 0x83, exception=illegal-data-address 0x02); status=response; elapsed_ms=1.250; classification=normal-or-exception-response
 ```
 
+啟用 `--health-check-interval` 時，該案例的 RX 行尾會附上 health probe 結果，例如
+`; health=ok` 或 `; health=FAILED (timeout)`，讓目標退化能精確對應到剛執行過的案例。
+
 `request-type` 依突變後封包的實際 function code 判定；例如 `function-code`、`bitflip` 或
 `random` 可能使它成為 `unknown (FC 0xNN)`；若連 function code 都不可用，則顯示
 `malformed-request (function code unavailable)`。功能碼最高 bit 被設為 1 時會附上
@@ -726,7 +747,7 @@ baseline FC03。
 
 這個工具服務於完全虛擬環境的可靠性測試，傳輸邊界刻意不套用唯讀功能碼 allowlist，也
 不要求完整 MBAP framing：FC05、FC06、FC15、FC16、未知功能碼、串接 ADU、非 MEI 0x0E 的
-FC43、`length` strategy 的不一致 MBAP length，以及 `huge-payload` 的 oversized ADU 都會
+FC43、`length` strategy 的截斷/延伸 PDU（MBAP length 與實際大小一致），以及 `huge-payload` 的 oversized ADU 都會
 實際送出。只有空 payload 無法傳輸，會標為 `status=blocked`、
 `classification=blocked-by-safety-policy`；stdout 摘要中的 `executed_cases` 與
 `blocked_cases` 可用來核對實際結果。過嚴的安全邊界會讓測試低弱且無效，因此目標必須是
@@ -776,6 +797,8 @@ stdout 摘要維持以下欄位：
   "executed": true,
   "executed_cases": 10,
   "blocked_cases": 0,
+  "health_checks": 0,
+  "health_failures": 0,
   "interval": 1.0,
   "target": {
     "host": "192.168.56.10",

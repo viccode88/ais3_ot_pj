@@ -162,7 +162,9 @@ def test_report_execute_paces_first_case_after_preflight(
         "modbus_cli.cli.time.sleep", lambda interval: events.append(("sleep", interval))
     )
 
-    def fake_execute(_cases: object, _timeout: float, interval: float, _progress: object) -> None:
+    def fake_execute(
+        _cases: object, _timeout: float, interval: float, _progress: object, **_kwargs: object
+    ) -> None:
         events.append(("execute", interval))
 
     monkeypatch.setattr("modbus_cli.cli.execute_cases", fake_execute)

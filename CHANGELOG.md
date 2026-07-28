@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Fix unbounded memory growth in passive PCAP analysis: cap retained raw evidence at 1 MiB per buffer and per-port flow maps at 1024 entries (with a `_truncated` marker), so process memory no longer grows with capture size.
+
+- Fix the `length` fuzz strategy to resize the ADU and keep the MBAP length field consistent, so cases exercise server-side length handling instead of being blocked as framing mismatches.
+- Add nine protocol/session-aware fuzz strategies: `protocol-id`, `address-wrap`, `truncated-mbap`, `concatenated-adu`, `pdu-mismatch`, `exception-shape`, `mei-subtype`, `rtu-over-tcp`, and `fill`.
+- Add `--health-check-interval N`: send a known-good FC03 health probe after every N transmitted fuzz cases and record `health_after` per case plus `health_checks`/`health_failures` in the summary, so target degradation is pinned to the preceding cases.
+- Add three session-layer fuzz strategies driven by a per-case `send_plan` executed over a single TCP connection: `fragmented-send` (slow-loris style segmented ADU), `repeat-storm` (N repeated sends on one connection), and `session-sequence` (valid/malformed/valid sequence with per-step `execution` evidence).
+
 - Move the legacy FC16 huge payload out of the CVE-2025-53476 vulnerability case into fuzzing as the `huge-payload` strategy; it is a fuzz capability, not a vuln trigger.
 - Relax the fuzz/replay transport boundary for fully virtual lab reliability testing: write functions, malformed framing, concatenated ADUs and oversized payloads are now transmitted; only empty payloads are blocked.
 - Show each executed fuzz case's decoded request and target-response packet types in the terminal.

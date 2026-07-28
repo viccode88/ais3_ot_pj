@@ -269,6 +269,13 @@ def parser() -> argparse.ArgumentParser:
         help="JSON report path (default: artifacts/fuzz-report.json)",
     )
     fuzz.add_argument(
+        "--health-check-interval",
+        type=int,
+        default=0,
+        metavar="N",
+        help="send a known-good FC03 health probe after every N transmitted cases (default: 0 = off)",
+    )
+    fuzz.add_argument(
         "--execute", action="store_true", help="required to transmit; otherwise generate only"
     )
     replay = commands.add_parser("replay", help="retransmit the first case in a JSON report")
@@ -449,12 +456,15 @@ def _print_fuzz_progress(event: FuzzProgressEvent, case: FuzzCase) -> None:
         )
         return
     elapsed = f"{case.elapsed_ms:.3f}" if case.elapsed_ms is not None else "unavailable"
-    print(
+    line = (
         f"[{case.case_id}] RX response-type={_fuzz_response_type(case)}; "
-        f"status={case.status}; elapsed_ms={elapsed}; classification={case.classification}",
-        file=sys.stderr,
-        flush=True,
+        f"status={case.status}; elapsed_ms={elapsed}; classification={case.classification}"
     )
+    if case.health_after is not None:
+        health = case.health_after
+        state = "ok" if health.get("ok") else f"FAILED ({health.get('status')})"
+        line += f"; health={state}"
+    print(line, file=sys.stderr, flush=True)
 
 
 def run(ns: argparse.Namespace) -> Any:
@@ -587,6 +597,8 @@ def run(ns: argparse.Namespace) -> Any:
         _validate_transport_options(ns)
         if ns.interval is not None and ns.interval <= 0:
             raise ValueError("interval must be > 0")
+        if ns.health_check_interval < 0:
+            raise ValueError("health-check-interval must be >= 0")
         rate = 1 / ns.interval if ns.interval is not None else ns.rate
         policy.validate_fuzz(ns.requests, rate, ns.concurrency)
         interval = ns.interval if ns.interval is not None else 1 / rate
@@ -600,7 +612,14 @@ def run(ns: argparse.Namespace) -> Any:
             generator.generate(i + 1, strategies[i % len(strategies)], ns.unit_id, host, port)
             for i in range(ns.requests)
         ]
-        execute_cases(cases, ns.timeout, interval, _print_fuzz_progress) if ns.execute else None
+        execute_cases(
+            cases,
+            ns.timeout,
+            interval,
+            _print_fuzz_progress,
+            health_check_interval=ns.health_check_interval,
+            health_unit_id=ns.unit_id,
+        ) if ns.execute else None
         save_cases(ns.output, cases)
         return {
             "seed": ns.seed,
@@ -608,6 +627,10 @@ def run(ns: argparse.Namespace) -> Any:
             "executed": ns.execute,
             "executed_cases": sum(case.sent_at is not None for case in cases),
             "blocked_cases": sum(case.status == "blocked" for case in cases),
+            "health_checks": sum(case.health_after is not None for case in cases),
+            "health_failures": sum(
+                case.health_after is not None and not case.health_after["ok"] for case in cases
+            ),
             "interval": interval,
             "target": {"host": host, "port": port, "source": target_source},
             "preflight_verified": ns.execute and selected is not None,
