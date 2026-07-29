@@ -31,7 +31,9 @@ class TCPTransport(Transport):
     def __init__(self, host: str, port: int = 502, timeout: float = 1.5) -> None:
         self.host, self.port, self.timeout = host, port, timeout
 
-    def exchange(self, payload: bytes, *, expect_response: bool = True) -> TransportResult:
+    def exchange(
+        self, payload: bytes, *, expect_response: bool = True, tolerant: bool = False
+    ) -> TransportResult:
         started = time.monotonic()
         try:
             with socket.create_connection((self.host, self.port), self.timeout) as stream:
@@ -39,18 +41,34 @@ class TCPTransport(Transport):
                 stream.sendall(payload)
                 if not expect_response:
                     return TransportResult(None, (time.monotonic() - started) * 1000, "sent")
-                header = _recv_exact(stream, 7)
+                header = _recv_exact(stream, 7) if not tolerant else _recv_upto(stream, 7)
                 if len(header) < 7:
                     return TransportResult(
-                        header,
+                        header if tolerant else header,
                         (time.monotonic() - started) * 1000,
-                        "disconnect",
-                        "partial MBAP header",
+                        "disconnect" if header else "timeout",
+                        "partial MBAP header" if header else None,
                     )
                 length = struct.unpack(">H", header[4:6])[0]
-                body = _recv_exact(stream, max(0, length - 1))
+                declared = max(0, length - 1)
+                if tolerant:
+                    body = _recv_upto(stream, declared)
+                    response = header + body
+                    # Fuzz targets routinely misdeclare the MBAP length (debug
+                    # function codes on OpenPLC v3 both over- and under-count), so
+                    # drain whatever else the peer already sent as evidence.
+                    response += _drain_available(stream, min(0.2, self.timeout))
+                    note = (
+                        None
+                        if len(body) == declared
+                        else f"partial MBAP body: declared {declared + 1}, received {len(body) + 1}"
+                    )
+                    return TransportResult(
+                        response, (time.monotonic() - started) * 1000, "response", note
+                    )
+                body = _recv_exact(stream, declared)
                 response = header + body
-                status = "response" if len(body) == max(0, length - 1) else "disconnect"
+                status = "response" if len(body) == declared else "disconnect"
                 return TransportResult(response, (time.monotonic() - started) * 1000, status)
         except TimeoutError as exc:
             return TransportResult(None, (time.monotonic() - started) * 1000, "timeout", str(exc))
@@ -68,6 +86,35 @@ def _recv_exact(stream: socket.socket, count: int) -> bytes:
     chunks = bytearray()
     while len(chunks) < count:
         part = stream.recv(count - len(chunks))
+        if not part:
+            break
+        chunks.extend(part)
+    return bytes(chunks)
+
+
+def _recv_upto(stream: socket.socket, count: int) -> bytes:
+    """Read up to ``count`` bytes; a read timeout keeps the partial bytes."""
+    chunks = bytearray()
+    while len(chunks) < count:
+        try:
+            part = stream.recv(count - len(chunks))
+        except TimeoutError:
+            break
+        if not part:
+            break
+        chunks.extend(part)
+    return bytes(chunks)
+
+
+def _drain_available(stream: socket.socket, window: float) -> bytes:
+    """Slurp bytes the peer already queued beyond the declared MBAP frame."""
+    chunks = bytearray()
+    stream.settimeout(max(0.01, window))
+    while len(chunks) < 65536:
+        try:
+            part = stream.recv(4096)
+        except TimeoutError:
+            break
         if not part:
             break
         chunks.extend(part)

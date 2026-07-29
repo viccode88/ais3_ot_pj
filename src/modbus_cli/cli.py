@@ -278,6 +278,11 @@ def parser() -> argparse.ArgumentParser:
     fuzz.add_argument(
         "--execute", action="store_true", help="required to transmit; otherwise generate only"
     )
+    fuzz.add_argument(
+        "--tolerant-read",
+        action="store_true",
+        help="keep partial bodies and drain trailing bytes (for misdeclared MBAP lengths)",
+    )
     replay = commands.add_parser("replay", help="retransmit the first case in a JSON report")
     replay.add_argument("case", type=Path, metavar="CASE", help="case object or report array")
     replay.add_argument(
@@ -300,6 +305,11 @@ def parser() -> argparse.ArgumentParser:
         default=0.02,
         metavar="SEC",
         help="seconds between replays (default: 0.02; maximum rate: 50/s)",
+    )
+    replay.add_argument(
+        "--tolerant-read",
+        action="store_true",
+        help="keep partial bodies and drain trailing bytes (for misdeclared MBAP lengths)",
     )
     minimize = commands.add_parser("minimize", help="create a structural baseline from a case")
     minimize.add_argument("case", type=Path, metavar="CASE", help="case object or report array")
@@ -619,6 +629,7 @@ def run(ns: argparse.Namespace) -> Any:
             _print_fuzz_progress,
             health_check_interval=ns.health_check_interval,
             health_unit_id=ns.unit_id,
+            tolerant_read=ns.tolerant_read,
         ) if ns.execute else None
         save_cases(ns.output, cases)
         return {
@@ -674,7 +685,18 @@ def run(ns: argparse.Namespace) -> Any:
             raise ValueError(f"replay blocked by fuzz safety policy: {safety_reason}")
         results = []
         for index in range(ns.times):
-            results.append(asdict(TCPTransport(host, ns.port, ns.timeout).exchange(payload)))
+            if ns.tolerant_read:
+                outcome = TCPTransport(host, ns.port, ns.timeout).exchange(payload, tolerant=True)
+            else:
+                outcome = TCPTransport(host, ns.port, ns.timeout).exchange(payload)
+            results.append(
+                {
+                    "response_hex": outcome.response.hex().upper() if outcome.response else None,
+                    "elapsed_ms": outcome.elapsed_ms,
+                    "status": outcome.status,
+                    "error": outcome.error,
+                }
+            )
             if ns.interval and index < ns.times - 1:
                 time.sleep(ns.interval)
         return {

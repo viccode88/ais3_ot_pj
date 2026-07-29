@@ -39,6 +39,11 @@ STRATEGIES = (
     "fragmented-send",
     "repeat-storm",
     "session-sequence",
+    "mbap-length-lie",
+    "pipelined-adus",
+    "debug-fc",
+    "fc-diagnostics",
+    "interleave-storm",
 )
 
 # Legacy FC16 Write Multiple Registers malformed payload: quantity stays in the
@@ -322,6 +327,171 @@ class CaseGenerator:
             }
             packet = bytearray(b"".join(payloads))
             mutations.append(f"session-sequence:middle={variant}")
+        elif strategy == "mbap-length-lie":
+            # Keep the PDU valid but make the MBAP length field lie, so targets
+            # that trust it for framing desynchronize from the real byte stream.
+            honest = len(packet) - 6  # unit identifier + PDU
+            lie = rng.choice(("minus-one", "plus-one", "exaggerated", "tiny"))
+            value = {
+                "minus-one": honest - 1,
+                "plus-one": honest + 1,
+                "exaggerated": honest * 10,
+                "tiny": 1,
+            }[lie]
+            packet[4:6] = value.to_bytes(2, "big")
+            mutations.append(f"mbap-length-lie:{lie}:length={value}:honest={honest}")
+            if rng.random() < 0.5:
+                trailing = bytes(rng.randrange(256) for _ in range(rng.randint(1, 8)))
+                packet.extend(trailing)
+                mutations.append(f"trailing-bytes={len(trailing)}")
+        elif strategy == "pipelined-adus":
+            # Send 2-4 ADUs in one write; framing bugs surface when a server
+            # reparses leftover bytes as the next request.
+            count = rng.choice((2, 3, 4))
+            adus: list[bytes] = []
+            kinds: list[str] = []
+            for offset in range(count):
+                kind = rng.choice(("valid-fc03", "malformed", "debug-fc"))
+                transaction = (index + offset) & 0xFFFF
+                if kind == "valid-fc03":
+                    adu = encode_adu(3, 0, 1, transaction_id=transaction, unit_id=unit_id)
+                elif kind == "malformed":
+                    shape = rng.choice(("truncated", "garbage", "length-lie"))
+                    if shape == "truncated":
+                        adu = encode_adu(3, 0, 1, transaction_id=transaction, unit_id=unit_id)[
+                            : rng.randint(1, 7)
+                        ]
+                    elif shape == "garbage":
+                        adu = bytes(rng.randrange(256) for _ in range(rng.randint(4, 12)))
+                    else:
+                        lied = bytearray(
+                            encode_adu(3, 0, 1, transaction_id=transaction, unit_id=unit_id)
+                        )
+                        lied[4:6] = rng.choice((1, 60, 0xFFFF)).to_bytes(2, "big")
+                        adu = bytes(lied)
+                    kind = f"malformed-{shape}"
+                else:
+                    debug_pdu = bytes((rng.choice((0x41, 0x45)),)) + bytes(
+                        rng.randrange(256) for _ in range(rng.randint(0, 3))
+                    )
+                    adu = struct.pack(
+                        ">HHHB", transaction, 0, len(debug_pdu) + 1, unit_id & 0xFF
+                    ) + debug_pdu
+                adus.append(adu)
+                kinds.append(kind)
+            packet = bytearray(b"".join(adus))
+            send_plan = {
+                "mode": "pipelined",
+                "count": count,
+                "payloads": [adu.hex().upper() for adu in adus],
+            }
+            mutations.append(f"pipelined-adus:count={count}:kinds={'+'.join(kinds)}")
+        elif strategy == "debug-fc":
+            # OpenPLC debugger function codes 0x41-0x45 with boundary parameters;
+            # the FC16 filler variant primes the receive buffer for servers that
+            # read debug parameters from the previous ADU's leftovers.
+            function = rng.choice((0x41, 0x42, 0x43, 0x44, 0x45))
+            varidx = rng.choice((0, 1, 255, 0xFFFF, rng.randrange(0x10000)))
+            flag = rng.choice((0, 1))
+            length = rng.choice((0, 0xFF, rng.randrange(256)))
+            if function == 0x41:
+                pdu = bytes((0x41,)) + bytes(rng.randrange(256) for _ in range(4))
+            elif function == 0x42:
+                value = rng.choice((0, 1, 0xFF, rng.randrange(256)))
+                pdu = struct.pack(">BHBB", 0x42, varidx, flag, length) + bytes((value,))
+                mutations.append(f"varidx={varidx}:flag={flag}:len={length}:value={value}")
+            elif function == 0x43:
+                endidx = rng.choice((0, 1, 255, 0xFFFF, rng.randrange(0x10000)))
+                pdu = struct.pack(">BHH", 0x43, varidx, endidx)
+                mutations.append(f"startidx={varidx}:endidx={endidx}")
+            elif function == 0x44:
+                pdu = bytes((0x44, length)) + b"".join(
+                    rng.choice((0, 1, 255, 0xFFFF)).to_bytes(2, "big")
+                    for _ in range(min(length, 8))
+                )
+                mutations.append(f"count={length}:varidx={varidx}")
+            else:
+                pdu = bytes((0x45, rng.choice((0, 1))))
+            debug_adu = struct.pack(
+                ">HHHB", (index + 1) & 0xFFFF, 0, len(pdu) + 1, unit_id & 0xFF
+            ) + pdu
+            if rng.random() < 0.5:
+                filler_pdu = struct.pack(">BHHB", 16, 0, 1, 2) + bytes(
+                    rng.randrange(256) for _ in range(2)
+                )
+                filler = struct.pack(
+                    ">HHHB", index & 0xFFFF, 0, len(filler_pdu) + 1, unit_id & 0xFF
+                ) + filler_pdu
+                packet = bytearray(filler + debug_adu)
+                send_plan = {
+                    "mode": "pipelined",
+                    "count": 2,
+                    "payloads": [filler.hex().upper(), debug_adu.hex().upper()],
+                }
+                mutations.append("fc16-filler-prefix")
+            else:
+                packet = bytearray(debug_adu)
+            mutations.insert(0, f"debug-fc:function={function:#04x}")
+        elif strategy == "fc-diagnostics":
+            variant = rng.choice(
+                ("fc08-subfunction", "fc17", "mei-canopen", "mei-read-device-id")
+            )
+            if variant == "fc08-subfunction":
+                subfunction = rng.choice((*range(0x16), 0xFFFF, rng.randrange(0x10000)))
+                data = rng.choice((0, 1, 0xFF00, 0xA5A5, rng.randrange(0x10000)))
+                pdu = struct.pack(">BHH", 8, subfunction, data)
+                mutations.append(f"fc08:subfunction={subfunction:#06x}:data={data:#06x}")
+            elif variant == "fc17":
+                pdu = bytes((17,)) + bytes(rng.randrange(256) for _ in range(rng.randint(0, 4)))
+            elif variant == "mei-canopen":
+                pdu = bytes((43, 0x0D)) + bytes(
+                    rng.randrange(256) for _ in range(rng.randint(0, 5))
+                )
+            else:
+                read_code = rng.choice((0, 1, 2, 3, 4, 5, 0x80, 0xFF))
+                object_id = rng.choice((0, 1, 2, 0x7F, 0x80, 0xFE, 0xFF))
+                pdu = bytes((43, 0x0E, read_code, object_id))
+                mutations.append(f"mei:read-dev-id-code={read_code}:object-id={object_id}")
+            packet = _rebuild_adu(packet, pdu)
+            mutations.append(f"fc-diagnostics:{variant}")
+        elif strategy == "interleave-storm":
+            # Fragmented 2-3 segment sends repeated 5-10 times with an injected
+            # session payload, all over one connection for sustained pressure.
+            rounds = rng.randint(5, 10)
+            delay = rng.choice((0.0, 0.02, 0.05))
+            variant = rng.choice(("garbage", "debug-fc", "truncated"))
+            if variant == "garbage":
+                middle = bytes(rng.randrange(256) for _ in range(rng.randint(4, 12)))
+            elif variant == "debug-fc":
+                middle_pdu = bytes((rng.choice((0x41, 0x45)), 0))
+                middle = struct.pack(
+                    ">HHHB", (index + 1) & 0xFFFF, 0, len(middle_pdu) + 1, unit_id & 0xFF
+                ) + middle_pdu
+            else:
+                middle = bytes(packet[: rng.randint(1, 7)])
+            payloads = [bytes(packet), middle]
+            steps: list[list[Any]] = []
+            for _round in range(rounds):
+                for payload in payloads:
+                    parts = rng.choice((2, 3))
+                    if len(payload) > parts:
+                        cuts = sorted(rng.sample(range(1, len(payload)), parts - 1))
+                        edges = [0, *cuts, len(payload)]
+                        for start, end in zip(edges, edges[1:]):
+                            steps.append(["send", payload[start:end].hex().upper()])
+                            if delay:
+                                steps.append(["sleep", delay])
+                    else:
+                        steps.append(["send", payload.hex().upper()])
+            packet = bytearray(b"".join(payloads))
+            send_plan = {
+                "mode": "storm",
+                "steps": steps,
+                "expect_responses": rounds * len(payloads),
+            }
+            mutations.append(
+                f"interleave-storm:variant={variant}:rounds={rounds}:delay={delay}"
+            )
         else:
             for _ in range(rng.randint(1, 4)):
                 position = rng.randrange(len(packet))
@@ -410,6 +580,51 @@ def _execute_send_plan(case: FuzzCase, timeout: float) -> None:
                     if chunk:
                         response = chunk
                 status = "response" if response else "disconnect"
+            elif mode == "pipelined":
+                payloads: list[str] = plan["payloads"]
+                stream.sendall(b"".join(bytes.fromhex(payload_hex) for payload_hex in payloads))
+                steps.append(
+                    {
+                        "action": "send-pipelined",
+                        "count": len(payloads),
+                        "bytes": sum(len(payload_hex) // 2 for payload_hex in payloads),
+                    }
+                )
+                received = 0
+                deadline = time.monotonic() + timeout
+                while received < int(plan.get("count", len(payloads))):
+                    try:
+                        stream.settimeout(max(0.01, deadline - time.monotonic()))
+                        chunk = _read_mbap(stream)
+                    except TimeoutError:
+                        break
+                    if not chunk:
+                        break
+                    response = chunk
+                    received += 1
+                steps.append({"action": "read-responses", "received": received})
+                status = "response" if received else "disconnect"
+            elif mode == "storm":
+                for position, step in enumerate(plan["steps"]):
+                    if step[0] == "send":
+                        stream.sendall(bytes.fromhex(step[1]))
+                    else:
+                        time.sleep(float(step[1]))
+                steps.append({"action": "send-steps", "count": len(plan["steps"])})
+                received = 0
+                deadline = time.monotonic() + timeout
+                while received < int(plan.get("expect_responses", 1)):
+                    try:
+                        stream.settimeout(max(0.01, deadline - time.monotonic()))
+                        chunk = _read_mbap(stream)
+                    except TimeoutError:
+                        break
+                    if not chunk:
+                        break
+                    response = chunk
+                    received += 1
+                steps.append({"action": "read-responses", "received": received})
+                status = "response" if received else "disconnect"
             else:
                 raise ValueError(f"unknown send plan mode {mode!r}")
     except TimeoutError as exc:
@@ -470,6 +685,7 @@ def execute_cases(
     progress: FuzzProgressCallback | None = None,
     health_check_interval: int = 0,
     health_unit_id: int = 1,
+    tolerant_read: bool = False,
 ) -> list[FuzzCase]:
     """Execute cases sequentially with a fixed delay between transmissions."""
     if interval < 0:
@@ -514,7 +730,10 @@ def execute_cases(
             _execute_send_plan(case, timeout)
         else:
             transport = TCPTransport(str(case.target["host"]), port, timeout)
-            result = transport.exchange(payload)
+            if tolerant_read:
+                result = transport.exchange(payload, tolerant=True)
+            else:
+                result = transport.exchange(payload)
             case.response_hex = result.response.hex().upper() if result.response else None
             case.elapsed_ms, case.status = result.elapsed_ms, result.status
         response = bytes.fromhex(case.response_hex) if case.response_hex else None
